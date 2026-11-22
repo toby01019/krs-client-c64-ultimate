@@ -9,12 +9,14 @@ Independent client project; K.R.S. itself is operated by its own project team.
 **C64 Ultimate: guest login, reading, display and TLS reconnection tested on
 the author's hardware.** Runs without a PC, browser or external proxy.
 
-Download **KRS-Client-Ultimate-20261122.zip** from this repository's Releases
+Download **KRS-Client-Ultimate-20261122-casefix.zip** from this repository's Releases
 or [itch.io](https://toby01019.itch.io/krs-client-c64-ultimate).
 This package includes the independently verified server-key correction dated
 18 November 2026. It replaces the older October binary. Hardware evidence:
-firmware 1.2.1 on 18 November and 1.1.0s2 on 19 November. Packaging on
-22 November is not a new hardware test. Source rebuild is byte-identical.
+firmware 1.2.1 on 18 November and 1.1.0s2 on 19 November. The 22-November case fix passed all 26 letter pairs in the compiled
+6502 renderer. Native K.R.S. startup/TLS and F2 switching also passed on
+firmware 1.2.1 that day; REST could not supply a physical pixel comparison.
+Source rebuild is byte-identical. Replace your old PRG with this case fix.
 
 **Original C64 + Ultimate-II+: EXPERIMENTAL DEVELOPMENT PROTOTYPE ONLY.**
 Not tested on its intended hardware, not ready for mailbox use, requires
@@ -52,12 +54,13 @@ Output: `source/build/KRS-CLIENT.PRG`. This existing build script uses Windows
 cc65 executable names. Included `client/KRS-CLIENT.PRG` SHA-256:
 
 ```text
-8451a72dbad55f9d5b3b9dd04814eebbbc940509cdc30f7cd4248b1681be97ee
+4aba652c14ac75910af785d2ec15720e1ca71c7b8d7ebb10a518d8478f376f32
 ```
 
 The current binary uses the Ultimate UCI networking interface and turbo
 registers. REU emulation alone does not establish compatibility with VICE.
-No complete emulator setup has been validated for live mailbox access.
+This download is the native Ultimate version. A separate private VICE
+test build exists; it is not included in this release.
 
 ## Security limits
 

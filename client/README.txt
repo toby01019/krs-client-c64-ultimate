@@ -106,5 +106,17 @@ Neuer, am 18.11.2026 unabhaengig gepruefter K.R.S.-Serverschluessel.
 Ersetzt die Programmfassung im Download vom 19.10.2026.
 Gastlogin und Wiederaufnahme am 18.11. auf Firmware 1.2.1 getestet;
 weiterer Hardwaretest am 19.11. auf Firmware 1.1.0s2 erfolgreich.
-Kein neuer Hardwaretest am Tag dieser Paketveroeffentlichung.
+Hardware-Nachpruefung am 22.11.2026: siehe Korrekturhinweis unten.
 Schreibfunktion vorhanden, kein oeffentlicher Ende-zu-Ende-Test bestaetigt.
+
+KORREKTUR 22.11.2026 - Gross-/Kleinschreibung im 80-Zeichen-Modus
+Die Zeichenzuordnung unterschied A-Z und a-z bisher nicht korrekt.
+Jetzt werden beide Faelle getrennt dargestellt. F2 (Shift+F1) schaltet
+weiterhin zwischen 40 und 80 Zeichen um. ZIP neu entpacken und die alte
+KRS-CLIENT.PRG auf der SD-Karte ersetzen; passende Quellen sind enthalten.
+Alle 26 Buchstabenpaare und der vollstaendige Renderer wurden mit dem
+kompilierten nativen Programm im 6502-Prozessortest geprueft. Auf einem
+echten C64 Ultimate mit Firmware 1.2.1 bestanden K.R.S.-Start (ca.19,5s),
+TLS-Verbindung und F2-Umschaltung. Ein physischer Pixelvergleich ueber
+die REST-Schnittstelle war nicht moeglich. Keine neue Schreibpruefung.
+Der separate Ultimate-II+-Prototyp bleibt unveraendert und ungetestet.

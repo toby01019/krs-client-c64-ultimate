@@ -81,7 +81,18 @@ Includes the independently verified K.R.S. server key update from
 18 November 2026. Replaces the binary distributed on 19 October 2026.
 Guest login and TLS resumption were tested on firmware 1.2.1 on
 18 November; a further hardware test passed on firmware 1.1.0s2 on
-19 November. No new hardware test was performed on the packaging date.
+19 November. A further hardware check on 22 November is described in the case-fix note below.
 The source rebuild matches the included PRG byte for byte.
 The separate Ultimate-II+ prototype is unchanged and remains untested
 on its intended hardware; it is not a ready-to-use release.
+
+22 NOVEMBER 2026 CASE FIX - 80-column letter display
+Corrects the ASCII-to-soft80 font mapping so uppercase A-Z and lowercase
+a-z are rendered separately. F2 (Shift+F1) still toggles 40/80 columns.
+Extract this ZIP again and replace KRS-CLIENT.PRG on your SD card.
+Matching source code is included. All 26 letter pairs and the complete
+compiled native renderer passed a 6502 processor test. On a real C64
+Ultimate running firmware 1.2.1, K.R.S. startup (about19.5s), TLS and
+F2 switching passed. A physical pixel comparison through REST was not
+available. No new posting test. The separate Ultimate-II+ prototype
+remains unchanged and untested on its intended hardware.

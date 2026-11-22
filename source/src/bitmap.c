@@ -101,7 +101,7 @@
 extern unsigned char font80[1024];
 void bitmap_begin(void),bitmap_end(void);
 static unsigned char active,old_bank,old_d011,old_d016,old_d018;
-static unsigned char fontchar(unsigned char c){c&=127;if(c>=97&&c<=122)c-=32;if(c<32)c=32;return c;}
+static unsigned char fontchar(unsigned char c){c&=127;if(c>=65&&c<=90)return c+32;if(c>=97&&c<=122)return c-32;if(c<32)c=32;return c;}
 void bitmap_render(void){
  unsigned int i,p,f;
  unsigned char row,col,r,a,b,ia,ib,na,nb,fresh=0;
