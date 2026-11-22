@@ -1,0 +1,1698 @@
+; boot.s — Startup, BASIC stub, screen output, phase 3 orchestration
+; Converted from ACME to ca65 in Phase 3 Batch D.
+
+        .include "constants.inc"
+
+        ; HTTPS target port. Overridable at build time for test rigs
+        ; whose TLS listener cannot bind the privileged default (e.g.
+        ; `make HTTPS_PORT=4433` for the unprivileged macOS/VICE e2e).
+        ; The default MUST stay 443 and the default build byte-identical.
+        .ifndef HTTPS_PORT
+        HTTPS_PORT = 443
+        .endif
+
+        ; HTTPS target host. `make HTTPS_HOST=github.com` writes the
+        ; string into build/https_host.inc (ca65 -D is numeric-only, so
+        ; a string override must travel via a generated include). The
+        ; default is www.foo.invalid (RFC 2606 / RFC 6761 reserved: it can
+        ; never resolve, so a default build cannot dial anything real) and
+        ; the default build byte-identical.
+        .include "https_host.inc"
+        ; Longest host / path a build (the asserts on the strings below)
+        ; or an operator (https_target_prompt, UCI only) may give.
+        HTTPS_HOST_MAX = 63
+        HTTPS_PATH_MAX = 100
+.if .defined(HTTPS_PIN_SPKI) .and (.not .defined(BACKEND_UCI_M3))
+        .import cert_pin_banner
+.endif
+; uci-m3 fills the sink only under HTTPS_BODY_TO_REU: otherwise no REU DMA
+.if .defined(BACKEND_UCI) .and ((.not .defined(BACKEND_UCI_M3)) .or .defined(HTTPS_BODY_TO_REU))
+SINK_PROBE = 1
+        .import reu_probe_size
+.endif
+.ifdef COLD_BANK
+        ; uci-comb cold-code bank (src/net/uci/cold_bank.s)
+        .include "cold_bank.inc"
+        .import cold_bank_init, cold_call, cold_err
+        .export cold_target_prompt, cold_call_ui
+.endif
+.ifdef TRUST_STORE
+        ; #155 phase 2 (L3): the trust policy, src/net/uci/trust_policy.s
+        .import trust_pre, trust_post, trust_state_init
+.ifdef TRUST_BUNDLE
+        .import trust_bundle
+.endif
+.endif
+
+        ; ---- exports: entry + print helpers ----
+        .export start
+        .export main_loop
+        .export print_string
+        .export print_null_terminated
+        .export print_resp_body
+
+        ; ---- Lane G viewer hook (UCI only; see do_https_get) ----
+.ifdef BACKEND_UCI
+        .ifdef VIEWER_LINKED            ; #155 phase 2: see Makefile KEEP_VIEWER
+        .import viewer_enter
+        .endif
+        .import http_body_sink, http_sink_full
+.endif
+
+        ; ---- exports: REU multiply table routines ----
+        ; c64-https owns the §8.2 reu_mul for libs/nistcurves' REU profile.
+        ; The X25519 sibling is built onchip (no REU surface), so it
+        ; neither provides nor needs one.
+        .ifndef BACKEND_UCI_M3          ; uci-m3 links no 6510 crypto
+        .export reu_mul_init
+        ; Under USE_NISTCURVES_ONCHIP the sibling's rebuilt
+        ; mul_8x8_onchip.o exports reu_fetch_mul_row unconditionally
+        ; (upstream has no guard on it) — yield ours to avoid the
+        ; ld65 duplicate. The in-tree routine body stays for local use.
+        .ifndef USE_NISTCURVES_ONCHIP
+        .export reu_fetch_mul_row
+        .endif
+
+        ; Every REU execute goes through src/reu_exec.s (#191, SPEC §8.2).
+        .import reu_execute
+
+        .endif                          ; BACKEND_UCI_M3
+
+        ; ---- exports: menu handlers ----
+        .export do_net_init
+        .export do_http_get
+        .export do_https_get
+
+        ; ---- exports: banner / menu / status strings ----
+        .export banner_msg
+        .export menu_msg
+        .export init_msg
+        .export net_fail_msg
+        .export net_ok_msg
+        .export dhcp_msg
+        .export dhcp_fail_msg
+        .export dhcp_ok_msg
+        .export no_net_msg
+        .export http_get_msg
+        .export https_get_msg
+        .export dns_fail_msg
+        .export dns_ok_msg
+        .export tcp_fail_msg
+        .export tcp_ok_msg
+        .export tls_fail_msg
+        .export tls_ok_msg
+        .export send_fail_msg
+        .export send_ok_msg
+        .export ok_msg
+        .export failed_msg
+        .export done_msg
+
+        ; ---- exports: 15 TLS state transition markers (used by tls13.s) ----
+        .export ch_sent_msg
+        .export sh_recv_msg
+        .export hk1_msg
+        .export keys_ok_msg
+        .export ee_recv_msg
+        .export cert_recv_msg
+        .export cv_recv_msg
+        .export fin_recv_msg
+        .export cfin_sent_msg
+        .export enc1_msg
+        .export rx_msg
+        .export got_msg
+        .export got2_msg
+        .export dec_msg
+        .export proc_msg
+
+        ; ---- exports: hostnames / path data ----
+        .export http_host_zimmers
+        .export http_host_zimmers_len
+        .export http_host_target
+        .export http_host_target_len
+        .export http_path_root
+
+        ; ---- exports: local BSS ----
+        .export net_initialized
+
+        ; ---- imports: 'Q' secret scrub (src/session_scrub.s) ----
+        .ifndef BACKEND_UCI_M3
+        .import session_scrub
+        .endif
+
+        ; ---- imports: entropy / DRBG / sqtab / crypto init ----
+        .import entropy_init
+        .import drbg_init_entropy
+        .import sqtab_init
+        .import crypto_init
+
+        ; ---- imports: network (backend adapter — ip65 or uci) ----
+        ; Networking comes ONLY through the §13 ABI header (issue #70).
+        ; §13 retired at contract v1.0.0; net_abi.inc carries the anchor.
+        .include "net_abi.inc"
+
+        ; ---- imports: TLS state machine ----
+        .import tls_connect
+        .import tls_send
+        .import tls_recv
+        .import tls_close
+
+        ; ---- imports: HTTP ----
+        .import http_get_plain
+        .import http_build_get
+        .import http_recv_body
+        .import http_resp_init
+        ; (http_body_sink for the HTTPS_BODY_TO_REU flag-set below is
+        ;  imported by the Lane G viewer-hook block above — the knob is
+        ;  UCI-only, matching that block's BACKEND_UCI guard.)
+
+        ; ---- imports: HTTP I/O state (data.asm) ----
+        .import http_host_ptr
+        .import http_host_len
+        .import http_path_ptr
+        .import http_path_len
+        .import http_port
+        .import http_req_buf
+        .import http_req_len
+        .import http_resp_buf
+        .import http_resp_len
+
+        ; ---- imports: TLS app-data pointers (data.asm) ----
+        .import tls_app_ptr
+        .import tls_app_len
+        .import tls_hostname
+        .import tls_hostname_len
+        .import tls_reached_connected
+
+        ; ---- imports: comb precompute (sibling nistcurves, comb profile) ----
+        ; vic_blank/vic_unblank (src/vic.s, LOADER_OVERFLOW) are pulled in
+        ; only here: the precompute is the one boot-time stretch long
+        ; enough for the badline tax to matter.
+        .ifdef USE_NISTCURVES_COMB
+        .import ec_precompute_256
+        .import vic_blank
+        .import vic_unblank
+
+        ; Border colours for the blanked precompute (see the call site).
+        ; While DEN is clear the whole display area is border colour, so
+        ; this IS the progress indicator. $0B (dark grey) is picked
+        ; because the KERNAL never leaves the border there, so it cannot
+        ; be mistaken for an idle machine; $0E (light blue) is the
+        ; KERNAL default and is restored as a constant, never as a
+        ; saved byte -- an unbalanced pair with a saved value leaves the
+        ; border wrong forever, a constant self-heals.
+COMB_BUSY_BORDER = $0B
+BORDER_DEFAULT   = $0E
+        .endif
+
+        ; ---- imports: multiply / REU staging (data.asm) ----
+        .import mul_8x8
+        .import mul_dma_lo
+        .import mul_dma_hi
+        .import mul_cached_a
+        .import poly_prod_lo
+        .import poly_prod_hi
+
+
+; =============================================================================
+; BASIC stub: 10 SYS 2061
+; Loaded at $0801 via EXEHDR segment (first bytes of LOADER region).
+; =============================================================================
+        .segment "EXEHDR"
+        .word   bas_end                 ; pointer to next BASIC line
+        .word   10                      ; line number
+        .byte   $9e                     ; SYS token
+        .byte   "2061"                  ; decimal address of `start` ($080D)
+        .byte   0                       ; end of BASIC line
+bas_end:
+        .word   0                       ; end of BASIC program
+
+; =============================================================================
+; Code
+; =============================================================================
+        .segment "CODE"
+
+; --- entry point (address $080D; SYS 2061) ---
+start:
+        ; disable BASIC ROM to free $A000-$BFFF
+        lda $01
+        and #%11111110          ; clear bit 0 (BASIC ROM off)
+        sta $01
+
+        sei                     ; disable interrupts during init
+
+        ; Zero SHADOW_BSS ($A000-$BFFF, 8 KiB). PRG LOAD does not zero BSS;
+        ; ca65 BSS segments in file-less regions start with whatever RAM
+        ; happened to contain. Without this, `net_initialized` and similar
+        ; boot guards read garbage and send us straight into ip65 code before
+        ; ip65 has been initialised, crashing us back to BASIC READY.
+        ldy #$00
+        ldx #$20                ; 32 pages = $2000 bytes
+        lda #$A0
+        sta @zbss_store+2       ; reset high byte (idempotent across resets)
+        lda #$00
+@zbss_page:
+@zbss_store:
+        sta $A000,y             ; self-modified high byte walks $A0..$BF
+        iny
+        bne @zbss_store
+        inc @zbss_store+2
+        dex
+        bne @zbss_page
+.ifdef SINK_PROBE
+        ; The REU's size bounds the HTTP body sink's region (src/http.s).
+        ; Probed before anything else writes the REU: it writes offset 0
+        ; of banks 0, 1, 2, 4 ... 128, which boot rewrites afterwards.
+        jsr reu_probe_size
+.endif
+.ifdef COLD_BANK
+        ; Before anything else can touch the image's copy at $C000 (the
+        ; TCP ring's range): stash it into the REU.
+        jsr cold_bank_init
+.endif
+.ifdef TRUST_STORE
+        jsr trust_state_init    ; RUN after 'Q' must not inherit an accept
+.endif
+
+        ; clear screen
+        lda #$93
+        jsr chrout
+
+        ; print banner (front-matter)
+        lda #<banner_msg
+        ldy #>banner_msg
+        jsr print_string
+
+        ; print backend-specific network identification line
+        lda #<net_banner_str
+        ldy #>net_banner_str
+        jsr print_string
+
+        ; print banner tail (trailing blank line before the menu)
+        lda #<banner_msg_tail
+        ldy #>banner_msg_tail
+.if .defined(HTTPS_PIN_SPKI) .and (.not .defined(BACKEND_UCI_M3))
+        jsr cert_pin_banner     ; #155: "SPKI PIN xxxxxxxx", then the tail
+.else
+        jsr print_string
+.endif
+
+        cli                     ; re-enable interrupts
+
+.ifndef BACKEND_UCI_M3
+        ; (uci-m3: the ESP32 does all of the TLS; none of this exists.)
+        ; initialize hardware entropy sources and seed DRBG
+        jsr entropy_init
+        jsr drbg_init_entropy
+
+        ; Shared crypto orchestrator. Currently calls only the stubbed
+        ; mul_tables_init — the in-tree x25519 sqtab_init / reu_mul_init
+        ; below run unconditionally under both backends.
+        jsr crypto_init
+
+        ; build quarter-square multiply table (needed by Poly1305, fe25519, ECDSA)
+        jsr sqtab_init
+
+        ; pre-compute REU multiply rows (depends on sqtab being populated)
+        ; Ensure BASIC ROM is off — data buffers and REU DMA targets live at $A000+
+        lda $01
+        and #%11111110
+        sta $01
+        ; Onchip note (issue #69): fp_mul generates rows on-chip and REU
+        ; banks 0/1 are never fetched, so this population pass is not
+        ; strictly needed under USE_NISTCURVES_ONCHIP. It is RETAINED
+        ; under both profiles anyway: C64U hardware testing (2026-07-20)
+        ; showed the first UCI TCP_CONNECT after a REU-quiet boot is
+        ; dropped by the FPGA bridge (0/6 e2e vs 3/6 for REU-profile
+        ; builds on the same flaky-WiFi day) — the boot-time REU DMA
+        ; traffic appears to settle shared expansion-I/O state. See
+        ; c64-test-harness#137 experiment log.
+        jsr reu_mul_init
+
+        ; Comb profile (SPEC §8.5): build the P-256 Lim-Lee anchor table
+        ; into REU bank 2 $0000-$3FFF. Needs sqtab (built above) + the
+        ; onchip row generator; runs once per boot. ~45 s at 48 MHz
+        ; (U64E, measured via boot_check) and ~34 min at a stock 1 MHz —
+        ; which is why every comb rig needs C64_INIT_WAIT and why the
+        ; shipped comb image is turbo-only. This comment used to say
+        ; "~seconds at turbo, ~25 s at stock 1 MHz"; the 1 MHz half was
+        ; ~86x low. Upstream carried the same error (libs/nistcurves
+        ; issue #121, "~25 Mcyc" against a measured ~2,061 Mcyc for the
+        ; FP_ONCHIP_MUL profile the comb build uses).
+        .ifdef USE_NISTCURVES_COMB
+        ; The precompute is by far the longest CPU-bound stretch of boot
+        ; and prints nothing of its own, so the badline DMA it pays is
+        ; pure loss — exactly the shape src/vic.s says to blank. At the
+        ; measured 6.3-6.8% that is a PREDICTED ~3 s of the ~45 s pass at
+        ; 48 MHz. Nobody has measured it on this call site yet; see the
+        ; PR for the bench_ecdsa_u64e-style A/B that would confirm it.
+        ;
+        ; UX: the border is the liveness indicator, not the banner.
+        ; vic_blank clears DEN only, so for the whole 45 s the display
+        ; area is solid BORDER colour and anything printed first is
+        ; invisible — reading a banner in the instant before the screen
+        ; dies is not a design, and a press-a-key acknowledgement would
+        ; cost more than the blank buys. So $D020 goes to a colour the
+        ; KERNAL never leaves it at, and the entire screen becomes that
+        ; colour for the duration: an unmistakable "working" signal that
+        ; is persistent, costs two register writes, and costs ZERO
+        ; cycles inside the compute loop. Badline DMA does not care what
+        ; colour the border is, so the 6.3-6.8% is untouched.
+        ;
+        ; Restored to a CONSTANT ($0E, the KERNAL default), not to a
+        ; saved value — same reasoning src/vic.s gives for restoring DEN
+        ; with ORA rather than a stashed byte. An unbalanced begin/end
+        ; with a saved value leaves the border wrong forever; with a
+        ; constant the next pass through here self-heals.
+        ;
+        ; Scoped to THIS call site rather than folded into vic_blank/
+        ; vic_unblank, deliberately: those two also wrap the X25519
+        ; scalar mults and the ecdsa_verify dispatch, which blank for
+        ; seconds mid-handshake and unblank onto the CH/SH/HK1/KEYS/
+        ; ENC1/RX markers. Recolouring the border around those would
+        ; churn the field diagnostic for no gain — they are short enough
+        ; that nobody mistakes them for a hang.
+        ;
+        ; Both writes run under `make VIC_BLANK=0` too, which keeps that
+        ; A/B control clean: the two arms then differ only in whether
+        ; DEN is touched, and the control arm still shows the busy
+        ; colour (with the text visible behind it).
+        ;
+        ; No PHP/PLP is needed around the unblank here, unlike the
+        ; ecdsa_verify dispatch in src/crypto/ecdsa_verify.s:
+        ; ec_precompute_256 returns no value and boot consumes no flag
+        ; from it. vic_blank/vic_unblank clobber only A, which is dead
+        ; across both calls, as is the A used for the border writes.
+        lda #<comb_precompute_msg
+        ldy #>comb_precompute_msg
+        jsr print_string
+        lda #COMB_BUSY_BORDER
+        sta border_color
+        jsr vic_blank
+        jsr ec_precompute_256
+        jsr vic_unblank
+        lda #BORDER_DEFAULT
+        sta border_color
+        .endif
+
+.endif ; BACKEND_UCI_M3
+
+        ; Auto-initialize networking at boot so the banner shows the
+        ; firmware-assigned IP without waiting for the user to press 'I'.
+        ; On ip65 this runs the full cs8900a + DHCP handshake; on the
+        ; UCI backend it probes the U64E command interface and reads the
+        ; firmware's existing DHCP lease via GET_IPADDR. A failure here
+        ; is non-fatal — the user can still retry from the menu.
+        jsr do_net_init
+
+        ; print menu
+        lda #<menu_msg
+        ldy #>menu_msg
+        jsr print_string
+
+        ; Ensure BASIC ROM stays off for all runtime operation.
+        ; Data buffers (fe_wide, x25_*, ECDSA) live at $A000-$BFFF.
+        ; The C64 writes to RAM under ROM, but reads hit ROM unless banked out.
+        lda $01
+        and #%11111110
+        sta $01
+
+        ; enter main loop
+        jmp main_loop
+
+; =============================================================================
+; main_loop - poll network, process TLS, handle user input
+; =============================================================================
+main_loop:
+        ; only poll network if initialized
+        lda net_initialized
+        beq @check_keys
+        jsr net_poll            ; pump ip65 (handles ZP swap)
+
+@check_keys:
+        jsr getin
+        beq main_loop           ; no key pressed
+
+        ; 'I' = initialize network
+        cmp #$49
+        bne @not_i
+        jsr do_net_init
+        jmp main_loop
+@not_i:
+.ifndef BACKEND_UCI_M3                  ; uci-m3: every connection is TLS
+        ; 'H' = plain HTTP GET
+        cmp #$48
+        bne @not_h
+        jsr do_http_get
+        jmp main_loop
+@not_h:
+.endif
+        ; 'G' = HTTPS GET
+        cmp #$47
+        bne @not_g
+        jsr do_https_get
+        jmp main_loop
+@not_g:
+        ; 'Q' = quit
+        cmp #$51
+        bne main_loop
+        ; falls through
+
+; =============================================================================
+; quit_to_basic - 'Q': scrub the session, then rebuild BASIC and enter READY.
+;
+; Not an RTS into the SYS that started us. BASIC resumes by running CHRGET
+; ($73-$8A) off TXTPTR ($7A/$7B), and trusts CURLIN ($39/$3A) and its
+; pointers ($2B-$38) -- ZP the crypto uses as scratch: X25519's fe_wide is
+; $40-$7F, nistcurves' fp_mul_i/j are $39/$3A, the TLS/ECDSA slots $02-$3F.
+; After a handshake that RTS executed a field element as CHRGET and printed
+; "?SYNTAX ERROR IN <garbage>".
+;
+; Instead: zero the secrets while $A000-$BFFF is still RAM, zero every ZP
+; byte we use and the stack page (pushed operands), then run the cold
+; start's own BASIC init minus its banner -- INITCZ (CHRGET from ROM,
+; TXTTAB/MEMSIZ/FRETOP) and NEW -- and enter READY via the BASIC warm-start
+; vector. The screen is kept, so a fetched body stays readable. INITV is
+; left out: the $0300 vectors are not ours, and resetting them would unhook
+; a cartridge or DOS wedge.
+;
+; NEW is deliberate: the image is not re-entrant from RUN (start does not
+; reset the BSS outside $A000-$BFFF), so it is not left looking runnable.
+; After 'Q' BASIC owns $0801-$9FFF, which is the image: variables grow up
+; from $0803, strings down from $A000, and LOAD writes over it. SYS
+; re-entry into the image is valid only before BASIC allocates anything,
+; and a re-entry that runs crypto clobbers BASIC's ZP again exactly as
+; before 'Q': BASIC is unusable after such a SYS returns. The tools/uci rigs
+; park the CPU (JMP *) or type only further SYS lines, so they are fine, and
+; session_scrub re-seeds the DRBG for exactly them. Do not cap MEMSIZ to
+; protect the image -- see engineering-notes, Known issues.
+;
+; The BASIC init routines sit in the KERNAL ROM's BASIC tail and are not
+; vectored; $E37B-$E45E is byte-identical in every C64 KERNAL VICE ships
+; (901227-01/-02/-03, SX-64, 4064).
+; =============================================================================
+BASIC_INITCZ    = $E3BF         ; CHRGET/RND seed, TXTTAB, MEMSIZ, FRETOP
+BASIC_SCRTCH    = $A644         ; NEW: empty program, then CLR
+BASIC_WARM_VEC  = $A002         ; -> $E37B: CLRCHN, STKINI, CLI, READY.
+
+quit_to_basic:
+        sei                     ; the stack page is about to be zeroed
+.ifndef BACKEND_UCI_M3          ; (uci-m3: the keys live on the ESP32)
+        jsr session_scrub
+.endif
+        lda #0
+        ldx #$7F - $02
+@zp:
+        sta $02,x               ; $02-$7F: every TLS/crypto/X25519 slot
+        dex
+        bpl @zp
+        ldx #$FF - zp_ptr
+@zp_hi:
+        sta zp_ptr,x            ; $FB-$FF: zp_ptr, zp_temp, zp_count
+        dex
+        bpl @zp_hi
+        inx                     ; X = 0
+@stack:
+        sta $0100,x             ; nothing below here is ever returned to
+        inx
+        bne @stack
+quit_scrubbed:                  ; tools/test_quit_basic_exit.py stops here
+        ldx #$FB                ; the cold start's stack pointer
+        txs
+        lda $01
+        ora #%00000001          ; BASIC ROM back in
+        sta $01
+        jsr BASIC_INITCZ
+        jsr BASIC_SCRTCH
+        jmp (BASIC_WARM_VEC)
+
+; =============================================================================
+; do_net_init - initialize network (menu-driven)
+; =============================================================================
+do_net_init:
+        lda #<init_msg
+        ldy #>init_msg
+        jsr print_string
+
+        jsr net_init
+        bcc @init_ok
+
+        lda #<net_fail_msg
+        ldy #>net_fail_msg
+        jsr print_string
+.ifdef BACKEND_UCI_M3
+        jmp m3_report_fail      ; the firmware's line, or PRESS RESET
+.else
+        rts
+.endif
+
+@init_ok:
+        lda #<net_ok_msg
+        ldy #>net_ok_msg
+        jsr print_string
+
+        ; DHCP
+        lda #<dhcp_msg
+        ldy #>dhcp_msg
+        jsr print_string
+
+        jsr net_dhcp_acquire
+        bcc @dhcp_ok
+
+        lda #<dhcp_fail_msg
+        ldy #>dhcp_fail_msg
+        jsr print_string
+.ifdef BACKEND_UCI_M3
+        jmp m3_report_fail
+.else
+        rts
+.endif
+
+@dhcp_ok:
+        lda #<dhcp_ok_msg
+        ldy #>dhcp_ok_msg
+        jsr print_string
+        jsr print_local_ip
+
+        lda #1
+        sta net_initialized
+        rts
+
+; =============================================================================
+; print_string - print null-terminated string at A(lo)/Y(hi)
+;
+; Also aliased as `print_null_terminated` for the screen_marker macro in
+; macros.inc.
+; =============================================================================
+print_string:
+print_null_terminated:
+        sta zp_ptr
+        sty zp_ptr+1
+        ldy #0
+@loop:
+        lda (zp_ptr),y
+        beq @done
+        jsr chrout
+        iny
+        bne @loop
+@done:
+        rts
+
+; =============================================================================
+; do_http_get - plain HTTP GET (menu-driven)
+; =============================================================================
+do_http_get:
+        ; check network is up
+        lda net_initialized
+        bne @net_ok
+        lda #<no_net_msg
+        ldy #>no_net_msg
+        jsr print_string
+        rts
+
+@net_ok:
+        lda #<http_get_msg
+        ldy #>http_get_msg
+        jsr print_string
+
+        ; set host pointer and length
+        lda #<http_host_zimmers
+        sta http_host_ptr
+        lda #>http_host_zimmers
+        sta http_host_ptr+1
+        lda #http_host_zimmers_len
+        sta http_host_len
+
+        ; set path pointer and length
+        lda #<http_path_root
+        sta http_path_ptr
+        lda #>http_path_root
+        sta http_path_ptr+1
+        lda #1
+        sta http_path_len
+
+        ; set port to 80
+        lda #80
+        sta http_port
+        lda #0
+        sta http_port+1
+
+        ; call the all-in-one plain HTTP GET
+        jsr http_get_plain
+        bcc @http_ok
+
+        lda #<failed_msg
+        ldy #>failed_msg
+        jsr print_string
+        rts
+
+@http_ok:
+        lda #<ok_msg
+        ldy #>ok_msg
+        jsr print_string
+
+        ; display response body
+        jsr print_resp_body
+        rts
+
+; =============================================================================
+; do_https_get - full HTTPS GET flow (menu-driven)
+; =============================================================================
+.ifndef BACKEND_UCI_M3                  ; uci-m3's own arm follows the .else
+do_https_get:
+        ; check network is up
+        lda net_initialized
+        bne @net_ok
+        lda #<no_net_msg
+        ldy #>no_net_msg
+        jsr print_string
+        rts
+
+@net_ok:
+        jsr http_resp_init      ; no http_status etc. from the last fetch
+.ifdef BACKEND_UCI
+        ; #155 phase 2: the operator types the target (https_target_prompt,
+        ; below). It sets everything the ip65 arm sets inline, with the host
+        ; in tls_hostname, so SNI, the Host header, the firmware's DNS and
+        ; x509_verify_hostname all read the one typed, lowercased name.
+        jsr https_target_prompt
+.ifdef TRUST_STORE
+        ; L3: the trust policy decides what the hook enforces, before the
+        ; dial. Its only keyboard reads are in trust_pre and trust_post.
+        bcs @no_dial
+        jsr trust_pre
+.endif
+        bcc @target_set
+@no_dial:
+        rts                     ; refused: reported, nothing dialled
+@target_set:
+.ifdef TRUST_BUNDLE
+        jsr trust_bundle        ; advisory pins; never refuses
+.endif
+.ifdef TRUST_STORE
+@redial:                        ; trust_post's one-fetch UNPINNED retry
+.endif
+        ; --- DNS resolve (UCI: stages the name for TCP_CONNECT) ---
+        lda #<tls_hostname
+        ldx #>tls_hostname
+.else
+        ; Issue #128: print the ACTUAL target, not a hardcoded literal.
+        ; This banner used to read "HTTPS GET WWW.FOO.BAR..." unconditionally,
+        ; so a `make HTTPS_HOST=en.wikipedia.org` build announced the default
+        ; host on
+        ; screen while connecting to wikipedia perfectly well. The connection
+        ; was always right — http_host_target drives both the SNI copy and
+        ; net_dns_resolve, a few lines below — but the only thing the operator
+        ; can see said otherwise, which reads as "the build knob did nothing".
+        lda #<https_get_msg
+        ldy #>https_get_msg
+        jsr print_string
+        ; http_host_target is ASCII (it comes from the Makefile), so it goes
+        ; through ascii_chrout rather than CHROUT directly — raw ASCII
+        ; lowercase renders as PETSCII graphics in the default charset
+        ; (issue #28), which would turn "en.wikipedia.org" into line noise.
+        ldx #0
+@banner_host:
+        lda http_host_target,x
+        beq @banner_host_done
+        jsr ascii_chrout
+        inx
+        bne @banner_host
+@banner_host_done:
+        lda #<https_get_tail_msg
+        ldy #>https_get_tail_msg
+        jsr print_string
+
+        ; --- set HTTP host/path/port ---
+        lda #<http_host_target
+        sta http_host_ptr
+        lda #>http_host_target
+        sta http_host_ptr+1
+        lda #http_host_target_len
+        sta http_host_len
+
+        lda #<https_path_target
+        sta http_path_ptr
+        lda #>https_path_target
+        sta http_path_ptr+1
+        lda #https_path_target_len
+        sta http_path_len
+
+        lda #<HTTPS_PORT
+        sta http_port
+        lda #>HTTPS_PORT
+        sta http_port+1
+
+        ; --- copy hostname into tls_hostname for SNI ---
+        ldx #0
+@copy_host:
+        lda http_host_target,x
+        beq @copy_done
+        sta tls_hostname,x
+        inx
+        cpx #63                 ; guard: max 63 chars
+        bne @copy_host
+@copy_done:
+        lda #0
+        sta tls_hostname,x      ; null-terminate
+        stx tls_hostname_len
+        ; #204: a new attempt starts here. A DNS/TCP failure below never
+        ; reaches tls_connect's own clear, so clear the latch before them.
+        sta tls_reached_connected
+
+        ; --- DNS resolve ---
+        lda #<http_host_target
+        ldx #>http_host_target
+.endif
+        jsr net_dns_resolve
+        bcc @dns_ok
+
+        lda #<dns_fail_msg
+        ldy #>dns_fail_msg
+        jsr print_string
+.ifdef TRUST_STORE
+        jmp @finish             ; every exit after trust_pre: trust_post
+.else
+        rts
+.endif
+
+@dns_ok:
+        lda #<dns_ok_msg
+        ldy #>dns_ok_msg
+        jsr print_string
+
+        ; --- TCP connect on HTTPS_PORT (default 443) ---
+        lda #<HTTPS_PORT        ; port low byte
+        ldx #>HTTPS_PORT        ; port high byte
+        jsr net_tcp_connect
+        bcc @tcp_ok
+
+        lda #<tcp_fail_msg
+        ldy #>tcp_fail_msg
+        jsr print_string
+.ifdef TRUST_STORE
+        jmp @finish
+.else
+        rts
+.endif
+
+@tcp_ok:
+        lda #<tcp_ok_msg
+        ldy #>tcp_ok_msg
+        jsr print_string
+
+        ; --- TLS handshake ---
+        jsr tls_connect
+        bcc @tls_ok
+
+        lda #<tls_fail_msg
+        ldy #>tls_fail_msg
+        jsr print_string
+        jsr net_tcp_close
+.ifdef TRUST_STORE
+        jmp @finish
+.else
+        rts
+.endif
+
+@tls_ok:
+        lda #<tls_ok_msg
+        ldy #>tls_ok_msg
+        jsr print_string
+
+        ; --- build HTTP GET request ---
+        jsr http_build_get
+
+        ; --- send request via TLS ---
+        lda #<http_req_buf
+        sta tls_app_ptr
+        lda #>http_req_buf
+        sta tls_app_ptr+1
+        lda http_req_len
+        sta tls_app_len
+        lda http_req_len+1
+        sta tls_app_len+1
+
+        jsr tls_send
+        bcc @send_ok
+
+        lda #<send_fail_msg
+        ldy #>send_fail_msg
+        jsr print_string
+        jmp @close
+
+@send_ok:
+        lda #<send_ok_msg
+        ldy #>send_ok_msg
+        jsr print_string
+
+        ; --- receive + parse response ---
+        ; Shared production path (issue #72): http_recv_body walks status
+        ; line + headers + body with Content-Length termination, leaving
+        ; the BODY in http_resp_buf / http_resp_len. Replaces the old
+        ; first-record-only copy loop that showed headers and lost the
+        ; body whenever it arrived as a second TLS record.
+.ifdef HTTPS_BODY_TO_REU
+        lda #1                  ; W4: stream the body into the REU at
+        sta http_body_sink      ;  http_reu_body_base (see src/http.s)
+.endif
+        jsr http_recv_body
+
+.if .defined(BACKEND_UCI) .and .defined(VIEWER_LINKED)
+        ; Lane G stretch-goal hook: when the body sink routed the
+        ; response into the REU (http_body_sink != 0), drop into the
+        ; scrollable viewer instead of printing the bounce buffer.
+        ; Without VIEWER_LINKED nothing sets the sink (it is SHADOW BSS,
+        ; zeroed at boot), so the hook would be a dead branch.
+        lda http_body_sink
+        beq @print_body
+        lda http_sink_full      ; the body outgrew its REU region: the
+        bne @sink_full          ;  sink stopped it, and wrote nothing past
+        jsr viewer_enter
+        jmp @close
+@sink_full:
+        lda #<sink_full_msg
+        ldy #>sink_full_msg
+        jsr print_string
+        jmp @close
+@print_body:
+.endif
+        ; display response body
+        jsr print_resp_body
+
+@close:
+        jsr tls_close
+        jsr net_tcp_close
+
+        lda #<done_msg
+        ldy #>done_msg
+        jsr print_string
+.ifdef TRUST_STORE
+@finish:
+        ; The socket is closed on every path that reaches here, so the
+        ; store may be written and the operator asked (trust_post).
+        jsr trust_post
+        bcs :+
+        jmp @redial             ; C=0: once more, unpinned
+:
+.endif
+        rts
+.else
+        .include "m3_https_get.inc"     ; src/net/uci-m3/: do_https_get
+.endif ; BACKEND_UCI_M3
+
+.if .defined(BACKEND_UCI) .and .defined(VIEWER_LINKED)
+sink_full_msg:
+        .byte "BODY TOO BIG FOR THE REU", $0d, 0
+.endif
+
+; =============================================================================
+; print_resp_body - print up to 200 bytes of http_resp_buf to screen.
+; Bytes originate from the network as ASCII, so they are fed through
+; ascii_chrout (below) which translates ASCII -> PETSCII before CHROUT.
+; =============================================================================
+print_resp_body:
+        ldx #0
+@loop:
+        cpx #200
+        beq @done
+        lda http_resp_buf,x
+        beq @done               ; stop at null
+        jsr ascii_chrout
+        inx
+        bne @loop
+@done:
+        lda #$0d                ; trailing carriage return
+        jsr chrout
+        rts
+
+; =============================================================================
+; ascii_chrout - translate ASCII byte in A to PETSCII and print via CHROUT.
+;
+; Mapping (default uppercase/graphics character set, strategy B):
+;   $0A (LF)        -> $0D       (CHROUT advances one line)
+;   $0D (CR)        -> $0D       (pass through)
+;   $20-$3F         -> pass through (space, digits, punctuation)
+;   $40-$5F         -> pass through (@, uppercase A-Z, [\]^_)
+;   $61-$7A (a-z)   -> uppercase fold ($41-$5A) so lowercase letters render
+;                      as uppercase glyphs instead of graphics characters.
+;   everything else -> drop (return without calling CHROUT)
+;
+; Single entry point used by every render site that takes network-origin
+; ASCII bytes.  Preserves X and Y.  Clobbers A (consumed by CHROUT).
+; =============================================================================
+ascii_chrout:
+        cmp #$20
+        bcc @ctrl               ; $00-$1F: handle CR/LF, drop rest
+        cmp #$7f
+        bcs @drop               ; $7F-$FF: drop (DEL + high-bit)
+        cmp #$61
+        bcc @emit               ; $20-$60: pass through unchanged
+        cmp #$7b
+        bcs @drop               ; $7B-$7E: drop { | } ~
+        sec                     ; $61-$7A: a-z -> A-Z
+        sbc #$20
+@emit:
+        jmp chrout              ; CHROUT preserves X,Y; tail-call
+@ctrl:
+        cmp #$0d
+        beq @emit               ; CR pass through
+        cmp #$0a
+        bne @drop               ; LF -> CR, anything else drop
+        lda #$0d
+        jmp chrout
+@drop:
+        rts
+
+.ifdef BACKEND_UCI
+; =============================================================================
+; https_target_prompt - ask for the host and path to fetch (#155 phase 2, UCI)
+;
+;   HOST [www.foo.invalid]: _
+;   PATH [/]: _
+;
+; RETURN on an empty field keeps the build-time HTTPS_HOST / HTTPS_PATH.
+;
+; Out: C=0  tls_hostname/_len = the host (typed ones lowercased),
+;           http_host_ptr/len -> tls_hostname, http_path_ptr/len,
+;           tls_reached_connected = 0, and the "HTTPS GET <host>..." banner
+;           printed. http_port is left alone: do_https_get dials HTTPS_PORT
+;           directly and only http_get reads http_port.
+;      C=1  the entry was refused and "INVALID TARGET" printed; nothing is
+;           dialled. tls_hostname_len is 0 on this exit, so a name check run
+;           against the leftovers could only fail.
+;
+; Refused — never truncated, never "fixed up":
+;   * a key that is not printable ASCII once translated (cursor keys,
+;     RUN/STOP, space, graphics), or one past the field's cap. The cap is
+;     the same 63 / 100 chars boot.s asserts for the build-time strings, so
+;     a typed target can never be longer than one that builds;
+;   * a host that is not [a-z0-9.-] with no empty label (leading, trailing
+;     or doubled '.'); x509_name.s's wildcard rule would let ".foo.org"
+;     match "*.foo.org", so the empty leftmost label is not cosmetic;
+;   * a path that does not start with '/'.
+; A refusal still reads both lines to their RETURN (a refused key's line is
+; swallowed unechoed; a refused host still gets the PATH prompt), flushes
+; the KERNAL key buffer, and only then prints INVALID TARGET. Returning
+; early would hand the rest of what the operator typed to main_loop, where
+; 'H' dials zimmers.net, 'I' re-inits the network and 'Q' quits.
+;
+; Keys: unshifted letters are lowercase, shifted ones uppercase (the path is
+; case-sensitive, the host is folded either way), and '_' is the left-arrow
+; key or C=+@ (the glyph the default charset draws as an underscore).
+;
+; The typed path goes into http_resp_buf. Its only reader is http_build_get,
+; which runs before the first response byte is stored there
+; (http.s's body_append and http_body_finish's REU fetch-back are its only
+; writers, both in the receive path), and the next GET prompts again.
+;
+; Its own segment, TARGET_PROMPT_CODE, because the room is in a different
+; region per cfg: CRYPTO_OVERLAY under c64-https-uci.cfg, LOADER under the
+; comb cfg with COLD_BANK=0, and the REU under the comb default: it is
+; linked to run in cert_buf and fetched there per call by
+; src/net/uci/cold_bank.s, whose refusal the stub below reports as COLD BANK
+; FAIL with C=1 (nothing dialled). The call site in do_https_get is smaller
+; than the inline block the ip65 arm keeps.
+; Clobbers: A, X, Y, zp_ptr.
+; =============================================================================
+.ifdef COLD_BANK
+https_target_prompt:
+        ldy #COLD_E_TARGET
+; cold_call_ui — cold_call for a tenant the operator is waiting on: a
+; refusal by the bank itself (cold_err != 0) is reported as COLD BANK FAIL.
+; Out: the tenant's C, or C=1 when the bank refused.
+cold_call_ui:
+        jsr cold_call
+        bcc @tp_out
+        lda cold_err            ; 0: the prompt ran and refused the entry
+        beq @tp_refused         ;  (it printed INVALID TARGET)
+        lda #<cold_fail_msg     ; the bank refused: say so, dial nothing
+        ldy #>cold_fail_msg
+        jsr print_string
+@tp_refused:
+        sec
+@tp_out:
+        rts
+cold_fail_msg:
+        .byte $0d, "COLD BANK FAIL", $0d, 0
+        .segment "TARGET_PROMPT_CODE"
+cold_target_prompt:
+.else
+        .segment "TARGET_PROMPT_CODE"
+https_target_prompt:
+.endif
+        lda #0                  ; #204: a new attempt starts here, before
+        sta tls_reached_connected ;  any refusal, DNS or TCP failure
+        sta tgt_fail
+
+        ; --- host ---
+        lda #<tgt_host_msg
+        ldy #>tgt_host_msg
+        jsr print_string
+        lda #<http_host_target
+        ldy #>http_host_target
+        jsr tgt_print_field
+        lda #<tls_hostname
+        ldy #>tls_hostname
+        ldx #HTTPS_HOST_MAX
+        jsr tgt_read_line
+        bcs @host_bad
+        ldy tgt_len
+        bne @host_check
+@host_default:                  ; RETURN alone: the build-time host
+        lda http_host_target,y
+        sta tls_hostname,y
+        beq @host_set
+        iny
+        bne @host_default       ; always (<= 63 chars, asserted)
+@host_check:
+        ; fold A-Z, require [a-z0-9.-], refuse an empty label. tgt_prev
+        ; starts as '.', so a leading '.' is the same test as "..".
+        ldy #0
+        lda #'.'
+        sta tgt_prev
+@hc_loop:
+        lda tls_hostname,y
+        beq @hc_end
+        cmp #'.'
+        bne @hc_not_dot
+        cmp tgt_prev
+        beq @host_bad           ; empty label
+        bne @hc_ok              ; always
+@hc_not_dot:
+        cmp #'-'
+        beq @hc_ok
+        cmp #'0'
+        bcc @host_bad
+        cmp #'9'+1
+        bcc @hc_ok
+        ora #$20                ; A-Z -> a-z; nothing else lands in a-z
+        cmp #'a'
+        bcc @host_bad
+        cmp #'z'+1
+        bcs @host_bad
+        sta tls_hostname,y
+@hc_ok:
+        sta tgt_prev
+        iny
+        bne @hc_loop            ; always
+@hc_end:
+        lda tgt_prev
+        cmp #'.'
+        beq @host_bad           ; trailing '.'
+@host_set:
+        sty tls_hostname_len
+        sty http_host_len
+        lda #<tls_hostname
+        sta http_host_ptr
+        lda #>tls_hostname      ; never 0: the flags make the bne a jump
+        sta http_host_ptr+1
+        bne @path
+@host_bad:
+        ; Still ask for the path: the operator is about to type it, and a
+        ; line nobody reads would reach main_loop as menu commands.
+        lda #$80
+        sta tgt_fail
+
+        ; --- path ---
+@path:
+        lda #<tgt_path_msg
+        ldy #>tgt_path_msg
+        jsr print_string
+        lda #<https_path_target
+        ldy #>https_path_target
+        jsr tgt_print_field
+        lda #<http_resp_buf
+        ldy #>http_resp_buf
+        ldx #HTTPS_PATH_MAX
+        jsr tgt_read_line
+        bcs @refused
+        ldy tgt_len
+        beq @path_default
+        lda http_resp_buf
+        cmp #'/'                ; origin-form request-target
+        bne @refused
+        lda #<http_resp_buf
+        ldx #>http_resp_buf     ; never 0: the flags make the bne a jump
+        bne @path_set
+@path_default:                  ; RETURN alone: the build-time path
+        lda #<https_path_target
+        ldx #>https_path_target
+        ldy #https_path_target_len
+@path_set:
+        sta http_path_ptr
+        stx http_path_ptr+1
+        sty http_path_len
+        bit tgt_fail
+        bmi @refused            ; the host was refused
+
+        ; --- banner: the name actually dialled (#128) ---
+        lda #<https_get_msg
+        ldy #>https_get_msg
+        jsr print_string
+        lda #<tls_hostname
+        ldy #>tls_hostname
+        jsr tgt_print_ascii
+        lda #<https_get_tail_msg
+        ldy #>https_get_tail_msg
+        jsr print_string
+        clc
+        rts
+
+@refused:
+        lda #0
+        sta $c6                 ; KERNAL NDX: drop any type-ahead
+        sta tls_hostname_len
+        lda #<tgt_bad_msg
+        ldy #>tgt_bad_msg
+        jsr print_string
+        sec
+        rts
+
+; -----------------------------------------------------------------------------
+; tgt_read_line - minimal line editor for https_target_prompt.
+;   In : A/Y = buffer, X = cap (chars, excluding the NUL)
+;   Out: RETURN echoed, buffer NUL-terminated, tgt_len = length, and
+;        C=0 every key was taken; C=1 a key was refused (see the header).
+;   A refused key does not end the line: it and every later key up to
+;   RETURN are swallowed unechoed, so the rest of what the operator typed
+;   never reaches main_loop. Stored bytes are ASCII; the echo is the key as
+;   typed. GETIN clobbers X and Y, so the index lives in tgt_len.
+; -----------------------------------------------------------------------------
+tgt_read_line:
+        sta zp_ptr
+        sty zp_ptr+1
+        stx tgt_cap
+        lda #0
+        sta tgt_len
+@wait:
+        jsr getin
+        beq @wait
+        ldy tgt_len
+        cmp #$0d
+        beq @done
+        bit tgt_bad
+        bmi @wait               ; swallowing the rest of a refused line
+        cmp #$14                ; DEL: erase the last character
+        bne @key
+        tya
+        beq @wait               ; nothing to erase
+        dec tgt_len
+        lda #$14
+        jsr chrout
+        jmp @wait
+@key:
+        cpy tgt_cap
+        bcs @refuse             ; one past the cap: refuse, never truncate
+        tax                     ; X = the key as typed, for the echo
+        cmp #$a4                ; C=+@, drawn as '_'
+        beq @underscore
+        cmp #$c1                ; shifted letters $C1-$DA -> A-Z
+        bcc @unshifted
+        cmp #$db
+        bcs @refuse
+        eor #$80
+        bne @store              ; always
+@unshifted:
+        cmp #$21                ; $21-$5F map to the same ASCII code
+        bcc @refuse             ;  ($5F, the left arrow, becomes '_')
+        cmp #$60
+        bcs @refuse
+        cmp #$41
+        bcc @store
+        cmp #$5b
+        bcs @store
+        ora #$20                ; unshifted letters $41-$5A -> a-z
+        bne @store              ; always
+@underscore:
+        lda #'_'
+@store:
+        sta (zp_ptr),y
+        inc tgt_len
+        txa
+        jsr chrout
+        jmp @wait
+@refuse:
+        lda #$80
+        sta tgt_bad
+        bne @wait               ; always
+@done:
+        lda #0
+        sta (zp_ptr),y
+        lda #$0d
+        jsr chrout
+        asl tgt_bad             ; C = refused; clears it for the next line
+        rts
+
+; tgt_print_field - print a field's default then "]: ".
+; tgt_print_ascii - print the NUL-terminated ASCII string at A/Y through
+; ascii_chrout (the build-time strings and tls_hostname are ASCII, #28).
+tgt_print_field:
+        jsr tgt_print_ascii
+        lda #<tgt_field_tail_msg
+        ldy #>tgt_field_tail_msg
+        jmp print_string
+tgt_print_ascii:
+        sta zp_ptr
+        sty zp_ptr+1
+        ldy #0
+@loop:
+        lda (zp_ptr),y
+        beq @end
+        jsr ascii_chrout        ; preserves Y
+        iny
+        bne @loop
+@end:
+        rts
+
+tgt_host_msg:       .byte "HOST [", 0
+tgt_path_msg:       .byte "PATH [", 0
+tgt_field_tail_msg: .byte "]: ", 0
+tgt_bad_msg:        .byte $0d, "INVALID TARGET", $0d, 0
+
+; Line-editor state. Stored in the segment, as x509_name.s does: the only
+; BSS home with room on uci-comb would be CRYPTO_OVERLAY anyway.
+tgt_cap:            .byte 0
+tgt_len:            .byte 0
+tgt_prev:           .byte 0
+tgt_bad:            .byte 0     ; bit 7: this line had a refused key
+tgt_fail:           .byte 0     ; bit 7: the host field was refused
+
+        .segment "CODE"
+.endif ; BACKEND_UCI
+
+.ifndef BACKEND_UCI_M3                  ; no 6510 crypto, no REU tables
+; =============================================================================
+; REU multiply table initialization (from c64-x25519 optimizations)
+; =============================================================================
+
+
+; =============================================================================
+; reu_mul_init - Generate 256 full multiplication rows and stash in REU
+;
+; For each a = 0..255, computes a*b for b = 0..255 and stashes:
+;   256 lo bytes at REU offset a*512
+;   256 hi bytes at REU offset a*512+256
+;
+; Uses mul_dma_lo/mul_dma_hi as staging buffers.
+; Uses mul_8x8 (requires sqtab to be initialized first).
+; Clobbers: A, X, Y
+; =============================================================================
+reu_mul_init:
+        lda #0
+        sta reu_init_a         ; outer counter (multiplier a)
+
+@outer:
+        ; For current a, compute a*b for all b=0..255
+        lda #0
+        sta reu_init_b         ; inner counter (multiplicand b)
+
+@inner:
+        lda reu_init_a
+        ldx reu_init_b
+        jsr mul_8x8            ; poly_prod_lo/hi = a * b
+
+        ldx reu_init_b
+        lda poly_prod_lo
+        sta mul_dma_lo,x
+        lda poly_prod_hi
+        sta mul_dma_hi,x
+
+        inc reu_init_b
+        bne @inner             ; loop b = 0..255
+
+        ; Stash lo table (256 bytes) to REU at offset a*512
+        lda #<mul_dma_lo
+        sta reu_c64_lo
+        lda #>mul_dma_lo
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo         ; REU offset low = 0
+        lda reu_init_a
+        asl                    ; A = a * 2 (high byte of offset)
+        sta reu_reu_hi
+        lda #0
+        adc #0                 ; carry into bank if a >= 128
+        sta reu_reu_bank
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi         ; length = 256
+        lda #0
+        sta reu_addr_ctrl      ; both addresses increment
+        lda #%10110000         ; execute + autoload + STASH (C64->REU)
+        jsr reu_execute
+
+        ; Stash hi table (256 bytes) to REU at offset a*512+256
+        lda #<mul_dma_hi
+        sta reu_c64_lo
+        lda #>mul_dma_hi
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        lda reu_init_a
+        asl                    ; a*2 (carry = bit 7 of a)
+        lda #0
+        adc #0                 ; bank = a >> 7
+        sta reu_reu_bank
+        lda reu_init_a
+        asl                    ; a*2
+        ora #1                 ; +1 for hi page (a*2 is even, so OR works)
+        sta reu_reu_hi
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi         ; length = 256
+        lda #0
+        sta reu_addr_ctrl
+        lda #%10110000         ; execute + autoload + STASH
+        jsr reu_execute
+
+        inc reu_init_a
+        beq @init_done         ; if wrapped to 0, done
+        jmp @outer
+@init_done:
+        ; Pre-configure constant REU registers for fetch routine
+        lda #<mul_dma_lo
+        sta reu_c64_lo
+        lda #>mul_dma_lo
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi         ; length high = 2 (512 bytes)
+        rts
+
+; =============================================================================
+; reu_fetch_mul_row - DMA a multiplication table row from REU to C64
+;
+; Input: mul_cached_a = multiplier value (0-255)
+; Fetches 512 bytes: 256 lo bytes to mul_dma_lo, 256 hi bytes to mul_dma_hi
+; Clobbers: A, N/V/Z (X, Y, C preserved -- see src/reu_exec.s)
+; =============================================================================
+reu_fetch_mul_row:
+        lda mul_cached_a
+        asl                    ; A = multiplier * 2, carry = bit 7
+        sta reu_reu_hi
+        lda #0
+        adc #0                 ; bank = carry from shift
+        sta reu_reu_bank
+        lda #%10110001         ; execute + autoload + FETCH (REU->C64)
+        jmp reu_execute         ; tail call: A clobbered, as documented
+
+
+.endif ; BACKEND_UCI_M3
+
+; =============================================================================
+; Strings (read-only)
+; =============================================================================
+; =============================================================================
+; print_local_ip - print net_local_ip in dotted decimal + CR
+;
+; Consumer UI, deliberately outside the network ABI (c64-lib-contract SPEC
+; §13.1 lists net_print_ip under "deliberately not in the contract"). One
+; copy for both backends now that net_local_ip is ABI data on ip65 too;
+; it replaced two identical per-backend routines. Rides LOADER_OVERFLOW:
+; the ip65 LOADER region is the tightest in the image and this was the
+; one routine that could leave it.
+; =============================================================================
+        .include "loader_overflow.inc"
+print_local_ip:
+        lda net_local_ip+0
+        jsr @print_byte
+        lda #'.'
+        jsr chrout
+        lda net_local_ip+1
+        jsr @print_byte
+        lda #'.'
+        jsr chrout
+        lda net_local_ip+2
+        jsr @print_byte
+        lda #'.'
+        jsr chrout
+        lda net_local_ip+3
+        jsr @print_byte
+        lda #$0d
+        jmp chrout
+
+; print decimal byte value (0-255), no leading zeros
+@print_byte:
+        sta @pb_val
+        ldx #0
+        sec
+@pb_100:
+        sbc #100
+        bcc @pb_100d
+        inx
+        jmp @pb_100
+@pb_100d:
+        adc #100
+        cpx #0
+        beq @pb_tens            ; skip leading zero
+        pha
+        txa
+        ora #$30
+        jsr chrout
+        pla
+@pb_tens:
+        ldx #0
+        sec
+@pb_10:
+        sbc #10
+        bcc @pb_10d
+        inx
+        jmp @pb_10
+@pb_10d:
+        adc #10
+        cpx #0
+        bne @pb_t_out
+        ldy @pb_val
+        cpy #10
+        bcc @pb_ones            ; value < 10, skip tens digit
+@pb_t_out:
+        pha
+        txa
+        ora #$30
+        jsr chrout
+        pla
+@pb_ones:
+        ora #$30
+        jmp chrout
+@pb_val: .byte 0
+
+        .segment "RODATA"
+
+; Banner is split in two so the per-backend `net_banner_str` (imported
+; from src/net/<backend>/net.s or net_banner.s) can be slotted between
+; the constant front-matter and the trailing blank lines at print time.
+banner_msg:
+        .byte "C64-HTTPS CLIENT V0.1"
+        .byte $0d, $0d
+.ifdef BACKEND_UCI_M3
+        .byte "TLS BY THE ULTIMATE (M3 FIRMWARE)"
+.else
+        .byte "TLS 1.3 / CHACHA20-POLY1305"
+.endif
+        .byte $0d, 0
+
+banner_msg_tail:
+        .byte $0d, 0
+
+; Comb profile only: printed immediately before the boot precompute. It is
+; NOT the liveness indicator -- the blank hides it for the whole 45 s and
+; the border colour carries that job (see the call site). It is here so the
+; boot log on screen says what the machine went quiet for, and so a run
+; captured after the fact (rigs read $0400 over DMA, which the blank does
+; not affect) explains itself. 30 columns, so it does not wrap. The
+; duration is the 48 MHz figure because the shipped comb image
+; (c64-https-uci-comb) is turbo-only; a stock 1 MHz machine takes ~34 min
+; and no one-line banner is going to make that look healthy. No `~` -- $7E
+; is not a printable PETSCII character.
+        .ifdef USE_NISTCURVES_COMB
+comb_precompute_msg:
+        .byte "COMB PRECOMPUTE - 45S AT 48MHZ"
+        .byte $0d, 0
+        .endif
+
+menu_msg:
+.ifdef BACKEND_UCI_M3
+        .byte "I=INIT  G=HTTPS  Q=QUIT"
+.else
+        .byte "I=INIT  H=HTTP  G=HTTPS  Q=QUIT"
+.endif
+        .byte $0d, $0d, 0
+
+init_msg:
+        .byte "INITIALIZING NETWORK..."
+        .byte $0d, 0
+
+net_fail_msg:
+        .byte "NETWORK INIT FAILED"
+        .byte $0d, 0
+
+net_ok_msg:
+        .byte "NETWORK OK"
+        .byte $0d, 0
+
+dhcp_msg:
+        .byte "REQUESTING DHCP..."
+        .byte $0d, 0
+
+dhcp_fail_msg:
+        .byte "DHCP FAILED"
+        .byte $0d, 0
+
+dhcp_ok_msg:
+        .byte "DHCP OK - IP: "
+        .byte 0
+
+no_net_msg:
+        .byte "ERROR: NETWORK NOT INITIALIZED"
+        .byte $0d, 0
+
+http_get_msg:
+        .byte "HTTP GET WWW.ZIMMERS.NET..."
+        .byte $0d, 0
+
+; Issue #128: prefix + suffix around the real host, printed by do_https_get.
+; Deliberately NOT one literal — the host is a build knob, so the banner has
+; to be assembled at runtime from http_host_target.
+https_get_msg:
+        .byte "HTTPS GET "
+        .byte 0
+
+https_get_tail_msg:
+        .byte "..."
+        .byte $0d, 0
+
+dns_fail_msg:
+        .byte "DNS RESOLVE FAILED"
+        .byte $0d, 0
+
+dns_ok_msg:
+        .byte "DNS OK"
+        .byte $0d, 0
+
+tcp_fail_msg:
+        .byte "TCP CONNECT FAILED"
+        .byte $0d, 0
+
+tcp_ok_msg:
+        .byte "TCP CONNECTED"
+        .byte $0d, 0
+
+tls_fail_msg:
+        .byte "TLS HANDSHAKE FAILED"
+        .byte $0d, 0
+
+tls_ok_msg:
+        .byte "TLS HANDSHAKE OK"
+        .byte $0d, 0
+
+; TLS state transition markers (debug) — imported by tls13.s
+ch_sent_msg:    .byte "CH", $0d, 0
+sh_recv_msg:    .byte "SH", $0d, 0
+hk1_msg:        .byte "HK1", $0d, 0
+keys_ok_msg:    .byte "KEYS", $0d, 0
+ee_recv_msg:    .byte "EE", $0d, 0
+cert_recv_msg:  .byte "CERT", $0d, 0
+cv_recv_msg:    .byte "CV", $0d, 0
+fin_recv_msg:   .byte "FIN", $0d, 0
+cfin_sent_msg:  .byte "CFIN", $0d, 0
+enc1_msg:       .byte "ENC1", $0d, 0
+rx_msg:         .byte "RX", $0d, 0
+got_msg:        .byte "GOT", $0d, 0
+got2_msg:       .byte "GOT2", $0d, 0
+dec_msg:        .byte "DEC", $0d, 0
+proc_msg:       .byte "PROC", $0d, 0
+
+send_fail_msg:
+        .byte "TLS SEND FAILED"
+        .byte $0d, 0
+
+send_ok_msg:
+        .byte "REQUEST SENT"
+        .byte $0d, 0
+
+ok_msg:
+        .byte "OK"
+        .byte $0d, 0
+
+failed_msg:
+        .byte "FAILED"
+        .byte $0d, 0
+
+done_msg:
+        .byte "CONNECTION CLOSED"
+        .byte $0d, 0
+
+; =============================================================================
+; hostname and path data
+; =============================================================================
+http_host_zimmers:
+        .byte "www.zimmers.net"
+        .byte 0
+http_host_zimmers_len = 15
+
+; --- HTTPS_TARGET_RODATA: the build-knob strings, isolated ---
+; Issue #126. These three labels are the only rodata in the program whose
+; SIZE is a build knob, and they used to sit in RODATA, which every cfg
+; routes into the always-resident crypto region. That region runs 10-25 B
+; from full on four of the five shipped/default configurations, so a longer
+; `make HTTPS_HOST=... HTTPS_PATH=...` did not overflow the strings' own
+; budget — it pushed LIB_NISTCURVES_P256_RODATA off the end of CRYPTO_HOT
+; and failed the link in a segment that has nothing to do with the knob:
+;
+;   ld65: Warning: Segment 'LIB_NISTCURVES_P256_RODATA' overflows memory
+;         area 'CRYPTO_HOT' by 34 bytes
+;
+; Isolating them means the knob's cost lands in ONE segment, placed by each
+; cfg. The asserted maxima below (63 B host + 100 B path + 63 B SNI) are
+; per-string guards, NOT a joint fit: at the maxima the link fails on both
+; ip65 profiles and on uci-comb. The failure is in the region that holds
+; these strings, but ld65 names whichever segment crosses that region's end
+; — HTTPS_TARGET_RODATA on ip65, LIB_NISTCURVES_MUL_CODE on uci-comb.
+        .segment "HTTPS_TARGET_RODATA"
+
+http_host_target:
+        .byte HTTPS_HOST_STR
+        .byte 0
+http_host_target_len = * - http_host_target - 1
+        ; the SNI copy loop below guards at 63 chars; refuse at build
+        ; time rather than truncating at runtime
+        .assert http_host_target_len <= HTTPS_HOST_MAX, error, "HTTPS_HOST exceeds the 63-char SNI guard"
+
+http_path_root:
+        .byte "/"
+        .byte 0
+
+; HTTPS request path, `make HTTPS_PATH=...` (see HTTPS_HOST above; same
+; generated-include mechanism). Default "/" keeps the build byte-identical.
+https_path_target:
+        .byte HTTPS_PATH_STR
+        .byte 0
+https_path_target_len = * - https_path_target - 1
+        .assert https_path_target_len <= HTTPS_PATH_MAX, error, "HTTPS_PATH too long for the request builder"
+
+.ifdef HTTPS_SNI_OVERRIDE
+        ; `make HTTPS_SNI=<name>` — SNI presented instead of the connect
+        ; host (relay/forensics debug knob; see Makefile). Consumed by
+        ; http_get's SNI copy in src/http.s.
+        .export https_sni_override
+https_sni_override:
+        .byte HTTPS_SNI_STR
+        .byte 0
+        .assert (* - https_sni_override - 1) <= 63, error, "HTTPS_SNI exceeds the 63-char SNI guard"
+.endif
+        ; --- end HTTPS_TARGET_RODATA ---
+
+; =============================================================================
+; Local BSS
+; =============================================================================
+        .segment "BSS"
+
+net_initialized:        .res 1
+; reu_init_a/b are state for the reu_mul_init loop.
+reu_init_a:             .res 1
+reu_init_b:             .res 1

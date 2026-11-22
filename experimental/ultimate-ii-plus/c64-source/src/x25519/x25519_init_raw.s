@@ -1,0 +1,925 @@
+; =============================================================================
+; x25519_init.s - Library initialization and REU helper routines
+;
+; REU execute discipline (c64-lib-contract SPEC v0.13.0 §8.2, tag c771935; tracked at
+; c64-x25519 #115, contract#146): every `sta reu_command` in this file
+; is immediately followed by the REU_SETTLE macro from src/constants.s,
+; which reads $DF00 once per spin, confirms bit 6 (END OF BLOCK), and
+; by that single I/O read leaves the >= 49-cycle post-execute settle the
+; contract brackets at 48 MHz on the U64E. Conformance is claimed at
+; <= 48 MHz only; 64 MHz is unbracketed. Faults land in the sticky
+; x25519_reu_fault byte (src/data.s), cleared at the entry of each
+; boot routine here that touches the REU.
+; =============================================================================
+
+.setcpu "6502"
+
+.include "constants.s"
+
+.export reu_clear_wide
+.if ::X25519_ONCHIP_MUL = 0
+; Onchip profile (issue #72): no REU on the hot path — the row-fetch
+; helper and its SMC bank-patch export drop out entirely (same
+; .export-demands-a-definition rule as the SQR_DMA_K gate below).
+.ifndef SHARED_REU_MUL_FETCH
+.export reu_fetch_mul_row
+.else
+; §8.2 fetch deferral: the canonical per-row fetch comes from the
+; provider, and it is the ONLY fetch name imported — SPEC v1.2.2 §8.2
+; names no patch site, so nothing here may reach into the provider's
+; code. INIT and FETCH move together (coupling assert in
+; reu_config.s); import-never-stub per §8.1's rule.
+.import reu_fetch_mul_row
+.endif
+.endif
+.if ::SQR_DMA_K
+; reu_fetch_doubled_row only exists in the SQR_DMA_K > 0 (default)
+; build. The K=0 / lib-x25519-1764 variant gates the proc body out
+; below (see banner at the proc), and matching call-site / .import
+; in src/fe25519.s drops with it. Without gating the .export, ca65
+; errors with "Exported symbol 'reu_fetch_doubled_row' was never
+; defined" because .export demands a definition in the same TU.
+.export reu_fetch_doubled_row
+.endif
+
+; --- Imports from mul_8x8.s ---
+.import ct_mul_8x8, poly_prod_lo, poly_prod_hi
+.import smc_sum_a_imm, smc_diff_a_imm
+
+; --- Imports from data.s ---
+.import mul_dma_lo, mul_dma_hi, mul_dma_carry, mul_cached_a
+.import x25519_reu_fault       ; §8.2 v0.13.0 sticky settle-fault byte
+.import x25519_reu_settle_cnt  ; REU_SETTLE slow-path spin counter (cross-TU internal)
+.import x25519_reu_settle_smp  ; REU_SETTLE slow-path status sample (cross-TU internal)
+
+.segment "LIB_X25519_CODE"
+
+; =============================================================================
+; REU multiplication table routines
+; =============================================================================
+
+; =============================================================================
+; X25519_DBL_STASH_ROW row - build and stash the fe25519_sqr tables for one row
+;
+; Entry: mul_dma_lo/hi hold row `row` of the plain a*b table (a = the byte
+; at `row`). Doubles it in place to 2*a*b (lo/hi) plus the 17th bit in
+; mul_dma_carry, then stashes lo/hi to the DOUBLED bank pair (base+4 +
+; (a >> 7), offset a*512) and the carry row to the CARRY bank (base+3,
+; offset a*256). Used by reu_mul_init (owner build) and by
+; x25519_sqr_tables_init (§8.2 deferral build), so both write the same
+; bytes. Boot-time only, over public table data. Clobbers A, X, C.
+; =============================================================================
+.macro X25519_DBL_STASH_ROW row
+        ldx #0
+:                              ; unnamed: keeps the caller's @-local scope
+        lda mul_dma_hi,x
+        asl                    ; carry = bit7 of original hi = bit16 of 2*a*b
+        lda #0
+        rol                    ; A = 0/1 carry bit
+        sta mul_dma_carry,x
+        lda mul_dma_lo,x
+        asl                    ; shift lo, carry out = bit7
+        sta mul_dma_lo,x
+        lda mul_dma_hi,x
+        rol                    ; shift hi with carry in
+        sta mul_dma_hi,x
+        inx
+        bne :-
+
+        ; Stash doubled lo table to bank (4 + a>>7), offset a*512 mod 65536
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        lda row
+        asl                    ; A = a*2, carry = bit7
+        sta reu_reu_hi
+        lda #X25519_REU_BANK_DOUBLED
+        adc #0                 ; bank = X25519_REU_BANK + 4 + (a >> 7)
+        sta reu_reu_bank
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi
+        sta reu_addr_ctrl
+        lda #0
+        sta reu_addr_ctrl
+        lda #%10110000
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+        ; Stash doubled hi table to banks 4-5, offset a*512+256
+        lda #<(mul_dma_hi)
+        sta reu_c64_lo
+        lda #>(mul_dma_hi)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        lda row
+        asl                    ; a*2
+        lda #X25519_REU_BANK_DOUBLED
+        adc #0                 ; bank = X25519_REU_BANK + 4 + (a >> 7)
+        sta reu_reu_bank
+        lda row
+        asl
+        ora #1
+        sta reu_reu_hi
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi
+        sta reu_addr_ctrl
+        lda #%10110000
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+        ; Stash carry table (256 bytes) to bank 3, offset a*256
+        lda #<(mul_dma_carry)
+        sta reu_c64_lo
+        lda #>(mul_dma_carry)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        lda row
+        sta reu_reu_hi
+        lda #X25519_REU_BANK_CARRY
+        sta reu_reu_bank
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi
+        sta reu_addr_ctrl
+        lda #%10110000
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+.endmacro
+
+; =============================================================================
+; reu_mul_init - Generate 256 full multiplication rows and stash in REU
+;
+; For each a = 0..255, computes a*b for b = 0..255 and stashes:
+;   256 lo bytes at REU offset a*512
+;   256 hi bytes at REU offset a*512+256
+;
+; Uses mul_dma_lo/mul_dma_hi as staging buffers.
+; Uses mul_8x8 (requires sqtab to be initialized first).
+; Clobbers: A, X, Y
+;
+; SPEC §8.2 migration gate. When a consumer defines SHARED_REU_MUL_INIT
+; (e.g. it links c64-nist-curves alongside c64-x25519 and wants one
+; canonical 128 KB build), this whole body is gated out and the
+; consumer's `reu_mul_tables_init` from its other adopter takes over.
+;
+; The private doubled/carry banks (+3..+5, SQR_DMA_K > 0) are built in
+; this proc's per-a loop in an owner build. The canonical §8.2 init does
+; not touch them, so under SHARED_REU_MUL_INIT x25519_sqr_tables_init
+; (below) derives them from the provider's table instead.
+;
+; The standalone build (no SHARED_REU_MUL_INIT) is unchanged: this
+; proc runs, both un-doubled and doubled rows are produced, and the
+; library is bit-identical to v0.6.0. `reu_mul_tables_init` is
+; published as the SPEC §8.2 canonical alias.
+;
+; "Safe to call twice" per SPEC §8.2: a second call rebuilds the same
+; final REU state with the same observable side effects (the full
+; ~3 s init runs again). NOT idempotent in the no-op sense.
+; =============================================================================
+.if ::X25519_ONCHIP_MUL = 0
+; (Whole init block gated out under the onchip profile, issue #72:
+;  there are no REU tables to build. The profile's boot obligation is
+;  sqtab_init only. Do NOT express this via SHARED_REU_MUL_INIT — that
+;  switch means "defers to a canonical §8.2 provider", and under
+;  onchip there is no provider and no table; the §8.2 bit is simply
+;  omitted from LIB_X25519_SHARED_PRIMITIVES. See SPEC §8.0 mask
+;  construction rules and docs/design/issue_72_onchip_mul.md.)
+.ifndef SHARED_REU_MUL_INIT
+.export reu_mul_init
+; SPEC §8.2 canonical entry point. In standalone builds, aliases the
+; library's own body (this proc). When SHARED_REU_MUL_INIT is defined,
+; this alias is not emitted here; the consumer's shared-primitives
+; module provides reu_mul_tables_init from elsewhere.
+.export reu_mul_tables_init
+reu_mul_tables_init = reu_mul_init
+
+; --- Cold segment (issue #68) ------------------------------------------------
+; reu_mul_init is init-only: sole caller is the host's boot sequence
+; (main.s in the standalone build), and its autoload-latch tail is a
+; one-time state effect that reu_clear_wide re-establishes per field
+; op. It lives in LIB_X25519_INIT_CODE (SPEC §4 name), declared as the
+; last FILE-EMITTING entry in MAIN (before bss-type segments — R5) by
+; both shipped cfgs, so a consumer may reclaim the segment as a
+; contiguous RAM region after init returns. See
+; docs/design/issue_68_cold_segment_split.md and LIBRARY.md §4.10.
+; The runtime-hot REU fetch helpers below (reu_fetch_mul_row,
+; reu_fetch_doubled_row, reu_clear_wide) MUST stay in LIB_X25519_CODE
+; — they run on every fe25519_mul/sqr.
+.segment "LIB_X25519_CODE"
+
+.proc reu_mul_init
+        lda #0
+        sta x25519_reu_fault   ; §8.2 v0.13.0: fresh fault window
+        sta reu_init_a         ; outer counter (multiplier a)
+
+@outer:
+        ; SMC-bake the multiplicand a into ct_mul_8x8's two immediate
+        ; operand sites, once per outer-a iteration (amortized over the
+        ; 256 inner b calls — chacha's calling convention).
+        lda reu_init_a
+        sta smc_sum_a_imm+1
+        sta smc_diff_a_imm+1
+
+        ; For current a, compute a*b for all b=0..255
+        lda #0
+        sta reu_init_b         ; inner counter (multiplicand b)
+
+@inner:
+        ldy reu_init_b         ; Y = b (ct_mul_8x8 multiplier operand)
+        jsr ct_mul_8x8         ; poly_prod_lo/hi = a * b
+
+        ldx reu_init_b
+        lda poly_prod_lo
+        sta mul_dma_lo,x
+        lda poly_prod_hi
+        sta mul_dma_hi,x
+
+        inc reu_init_b
+        bne @inner             ; loop b = 0..255
+
+        ; Stash lo table (256 bytes) to REU at offset a*512
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo         ; REU offset low = 0
+        lda reu_init_a
+        asl                    ; A = a * 2 (high byte of offset)
+        sta reu_reu_hi
+        lda #X25519_REU_BANK
+        adc #0                 ; bank = X25519_REU_BANK + (a >> 7)
+        sta reu_reu_bank
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi         ; length = 256
+        lda #0
+        sta reu_addr_ctrl      ; both addresses increment
+        lda #%10110000         ; execute + autoload + STASH (C64->REU)
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+        ; Stash hi table (256 bytes) to REU at offset a*512+256
+        lda #<(mul_dma_hi)
+        sta reu_c64_lo
+        lda #>(mul_dma_hi)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        lda reu_init_a
+        asl                    ; a*2 (carry = bit 7 of a)
+        lda #X25519_REU_BANK
+        adc #0                 ; bank = X25519_REU_BANK + (a >> 7)
+        sta reu_reu_bank
+        lda reu_init_a
+        asl                    ; a*2
+        ora #1                 ; +1 for hi page (a*2 is even, so OR works)
+        sta reu_reu_hi
+        lda #0
+        sta reu_len_lo
+        lda #1
+        sta reu_len_hi         ; length = 256
+        lda #0
+        sta reu_addr_ctrl
+        lda #%10110000         ; execute + autoload + STASH
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+.if ::SQR_DMA_K
+        ; --- Generate pre-doubled tables for fe25519_sqr (8f+8g) ---
+        ; Overwrite mul_dma_lo/hi with 2*a*b (17-bit), and fill mul_dma_carry
+        ; with the 17th bit. Regular tables were already stashed above.
+        ; Gated on `SQR_DMA_K > 0`: the K=0 (1764) build never reads
+        ; banks +3..+5, so it neither builds nor claims them
+        ; (LIB_X25519_REU_BANKS_USED $3B -> $03 in src/lib_manifest.s).
+        X25519_DBL_STASH_ROW reu_init_a
+.endif  ; SQR_DMA_K (non-zero)
+
+        inc reu_init_a
+        beq @init_done         ; if wrapped to 0, done
+        jmp @outer
+@init_done:
+        ; (W3 / v0.6 prep: the legacy "stash 64 zero bytes to REU bank 2
+        ;  offset 0" block that used to live here has been removed.
+        ;  reu_clear_wide was rewritten in v0.4.0 prep (W2) to do a CPU
+        ;  clear of fe_wide; nothing in the library reads from bank 2.
+        ;  Removing the stash frees REU bank 2 for sibling consumers and
+        ;  drops the LIB_X25519_REU_BANKS_USED claim from $3F to $3B.)
+
+        ; Pre-configure constant REU registers for fetch routine
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi         ; length high = 2 (512 bytes)
+        rts
+
+; SPEC §8.2 ZP scratch contract: these two byte slots are exported via
+; `.global` so reu_config.s's LIB_SHARED_REU_MUL_ZP_INIT_A / _B equates
+; (declared as link-time aliases under their respective .ifndef guards)
+; resolve to the same storage. Default consumers see the legacy
+; CODE-segment scratch; an override-via-`ca65 -D` consumer that
+; defines the equates earlier wins via the .ifndef.
+.global reu_init_a, reu_init_b
+reu_init_a:     .byte 0
+reu_init_b:     .byte 0
+.endproc
+.else ; SHARED_REU_MUL_INIT defined
+.if ::SQR_DMA_K
+; =============================================================================
+; x25519_sqr_tables_init - Build x25519's private fe25519_sqr banks under
+;                          §8.2 deferral
+;
+; Under SHARED_REU_MUL_INIT the provider's reu_mul_tables_init builds only
+; the shared a*b pair (base, base+1). fe25519_sqr at SQR_DMA_K > 0 also
+; reads the DOUBLED pair (base+4/+5) and the CARRY bank (base+3), which
+; only x25519 knows about. This routine derives them from the provider's
+; table: for each a it FETCHes row a from the pair into mul_dma_lo/hi and
+; runs the same X25519_DBL_STASH_ROW step reu_mul_init runs in an owner
+; build, so the private banks hold the same bytes either way.
+;
+; Order: jsr mul_tables_init / reu_mul_tables_init (provider), THEN this.
+; It reads the pair at X25519_REU_BANK (asserted equal to
+; LIB_SHARED_REU_MUL_BANK) with x25519's row layout (row a at bank
+; base + (a >> 7), offset (a*512) & $FFFF, lo page then hi page), which
+; is the layout fe25519_mul's inline fetch already assumes.
+;
+; Boot-time only, public data. Clears x25519_reu_fault at entry; leaves
+; the REU registers in the canonical fetch state (mul_dma_lo / 512 / 0 /
+; 0), as reu_mul_init does. Clobbers: A, X, Y.
+; =============================================================================
+.export x25519_sqr_tables_init
+.segment "LIB_X25519_CODE"
+
+.proc x25519_sqr_tables_init
+        lda #0
+        sta x25519_reu_fault   ; fresh fault window, as reu_mul_init
+        sta row
+@outer:
+        ; FETCH row a (512 B) into mul_dma_lo/hi. Every latch register is
+        ; written: the provider's init leaves them however it chose.
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi         ; 512 bytes
+        lda row
+        asl                    ; A = a*2, C = bit 7 of a
+        sta reu_reu_hi
+        lda #X25519_REU_BANK
+        adc #0                 ; bank = base + (a >> 7)
+        sta reu_reu_bank
+        lda #%10110001         ; execute + autoload + FETCH (REU->C64)
+        sta reu_command
+        REU_SETTLE
+
+        X25519_DBL_STASH_ROW row
+
+        inc row
+        beq @done
+        jmp @outer
+@done:
+        ; Canonical fetch latch for fe25519_mul's inline row DMA.
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi
+        rts
+
+row:    .byte 0
+.endproc
+.endif ; SQR_DMA_K
+.endif ; SHARED_REU_MUL_INIT
+.endif ; X25519_ONCHIP_MUL = 0 (issue #72 — init block)
+
+; =============================================================================
+; reu_fetch_mul_row - DMA a multiplication table row from REU to C64
+;
+; Input: A = a (row index, 0-255). Also stored to mul_cached_a.
+; Fetches 512 bytes: 256 lo bytes to mul_dma_lo, 256 hi bytes to mul_dma_hi
+; Clobbers: A and C. X and Y are preserved (REU_SETTLE counts its
+;           bounded spin in memory, not in X). The carry is NOT
+;           preserved: C on return is the bank-add's carry-out.
+;
+; The `bank_lda` regular local label (not cheap-`@`-local because we
+; address it from outside the proc via `proc::label` syntax, which
+; cheap-locals don't support) tags the LDA #X25519_REU_BANK instruction
+; so reu_fetch_mul_row_bank_patch (below) can export its immediate-byte
+; address. No in-tree code patches it any more (reu_fetch_doubled_row
+; does its own DMA #1); the export is kept, deprecated, for §6.5.
+;
+; REU state: SPEC §8.2 puts no precondition on REU registers, so this
+; proc writes every register the FETCH depends on (C64 address, REU
+; address, bank, length, address control) and trusts no latch. It may
+; be called after any x25519 routine, including fe25519_sqr, whose
+; doubled-row DMA #2 leaves the latch at mul_dma_carry / 256. On
+; return (autoload) the registers hold mul_dma_lo / length 512 /
+; REU address lo $00 / address control $00, the same canonical state
+; reu_mul_init leaves. No in-tree hot path calls this proc
+; (fe25519_mul inlines its own fetch), so the extra stores never
+; execute there.
+; =============================================================================
+; Back to the resident LIB_X25519_CODE segment: this proc and everything through
+; reu_clear_wide is runtime-hot (issue #68 cold-split boundary).
+.segment "LIB_X25519_CODE"
+
+.if ::X25519_ONCHIP_MUL = 0
+; =============================================================================
+; x25519_reu_settle_slow - REU_SETTLE's rare path (SPEC v0.13.0 §8.2)
+;
+; Reached from the REU_SETTLE macro (src/constants.s) whenever its one
+; unconditional $DF00 read did NOT show exactly "bit 6 set, bit 5
+; clear". Never taken on hardware so far (bit 6 was set on the first
+; read in all 19,416 measured calls) nor under VICE; kept out of line
+; so each expansion site carries 12 bytes, and so the clause's
+; logic is written once.
+;
+; Input:    A = (status & $60) ^ $40 from the macro's read.
+; Behaviour: records $02 in x25519_reu_fault if bit 5 (VERIFY ERROR) is
+;           seen on ANY sample; keeps spinning on bit 6 (END OF BLOCK)
+;           ALONE until it is set or X25519_REU_SETTLE_ITER status reads
+;           in total (macro + here) have been made, then records $01.
+;           A verify-fault sample never ends the spin early — the clause
+;           says confirm bit 6.
+; Clobbers: A only. X, Y, C preserved. Uses the cross-TU internal bytes
+;           x25519_reu_settle_smp / x25519_reu_settle_cnt (src/data.s).
+; =============================================================================
+.proc x25519_reu_settle_slow
+        eor #$40               ; back to status & $60
+        sta x25519_reu_settle_smp
+        lda #X25519_REU_SETTLE_ITER
+        sta x25519_reu_settle_cnt
+@check:
+        lda x25519_reu_settle_smp
+        and #$20               ; bit 5: VERIFY ERROR on this sample?
+        beq @no_b5
+        lda #$02
+        ora x25519_reu_fault
+        sta x25519_reu_fault
+@no_b5:
+        lda x25519_reu_settle_smp
+        and #$40               ; bit 6: END OF BLOCK confirmed?
+        bne @done
+        dec x25519_reu_settle_cnt
+        beq @expired           ; ITER reads made in total -> give up
+        lda reu_status         ; next sample (clears bits 5-7)
+        and #$60
+        sta x25519_reu_settle_smp
+        jmp @check
+@expired:
+        lda #$01               ; bound expired: transfer never confirmed
+        ora x25519_reu_fault
+        sta x25519_reu_fault
+@done:
+        rts
+.endproc
+.export x25519_reu_settle_slow
+
+.ifndef SHARED_REU_MUL_FETCH
+.proc reu_fetch_mul_row
+        ; SPEC §8.2: "The canonical per-row entry point is
+        ; reu_fetch_mul_row; A = a (row index) on entry". Until v0.15.0
+        ; this was `lda mul_cached_a` — it DISCARDED the caller's A and
+        ; read a private byte instead, so the documented entry was not
+        ; implemented (issue #127, arbitrated at contract#182).
+        ;
+        ; That is invisible standalone, because every in-tree caller set
+        ; mul_cached_a first. It bites §8.2 FETCH DEFERRAL: a deferring
+        ; build imports the provider's reu_fetch_mul_row, its callers
+        ; write THEIR private byte, the provider reads ITS OWN, both
+        ; symbols exist and the link is clean — so the fetch silently
+        ; returns whatever row the provider last cached. c64-nist-curves
+        ; had the identical defect from nistcurves_mul_cached_a.
+        ;
+        ; `sta` sets no flags, so the carry the `asl`/`adc #0` pair below
+        ; depends on is untouched, and this is the same 3 bytes / 4 cycles
+        ; the `lda` was. mul_cached_a stays written because it is NOT just
+        ; a parameter to this proc: fe25519.s reads it in the squaring
+        ; cross-term path (`sbc mul_cached_a` at :1338/:1435).
+        sta mul_cached_a       ; §8.2: A = a on entry
+        asl                    ; A = multiplier * 2, carry = bit 7
+        sta reu_reu_hi
+bank_lda:
+        lda #X25519_REU_BANK
+        adc #0                 ; bank = X25519_REU_BANK + (a >> 7)
+        sta reu_reu_bank
+        ; Every other FETCH register, written rather than trusted (see
+        ; banner). lda/sta leave C, so C is still the bank-add's carry.
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi         ; 512 bytes
+        lda #%10110001         ; execute + autoload + FETCH (REU->C64)
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+        rts
+.endproc
+
+; SMC patch point export. Address of the immediate-operand byte of the
+; `lda #X25519_REU_BANK` instruction inside reu_fetch_mul_row. +1 skips
+; the LDA opcode and lands on the immediate byte.
+; DEPRECATED: not §8.2 surface and unused in-tree; kept for §6.5 only.
+reu_fetch_mul_row_bank_patch := reu_fetch_mul_row::bank_lda + 1
+.export reu_fetch_mul_row_bank_patch
+.endif ; SHARED_REU_MUL_FETCH not defined (owner build carries the body)
+.endif ; X25519_ONCHIP_MUL = 0 (issue #72 — reu_fetch_mul_row + patch export)
+
+; =============================================================================
+; reu_fetch_doubled_row - DMA pre-doubled multiplication row for fe25519_sqr
+;
+; Input: A = multiplier value in mul_cached_a
+; Fetches 512 bytes from banks 4-5 to mul_dma_lo/hi (doubled lo+hi),
+; then 256 bytes from bank 3 to mul_dma_carry (17th-bit carry flags).
+; Clobbers: A and C (C from DMA #1's asl/adc; REU_SETTLE itself
+;           clobbers A only). X and Y preserved.
+; NOTE: Leaves REU registers in a non-default state; caller must restore
+; if the regular mul-row FETCH config is needed afterward (see
+; reu_clear_wide's autoload-restore tail, which is what fe25519_sqr
+; relies on between its calls and any subsequent fe25519_mul).
+;
+; Both DMAs are performed here, against x25519's own DOUBLED / CARRY
+; banks. DMA #1 does NOT go through reu_fetch_mul_row: under
+; SHARED_REU_MUL_FETCH that entry belongs to another library, and §8.2
+; gives no way to point it at a different bank (issue #134; the earlier
+; SMC-patch-and-restore design is in
+; docs/design/issue_15_smc_patch_doubled_fetch.md).
+;
+; Autoload-latch invariant (LOAD-BEARING — do not break):
+;   fe25519_mul's inline row DMA trusts the autoload latch for
+;   reu_c64_lo/hi and reu_len_lo/hi (it writes reu_reu_lo and
+;   reu_addr_ctrl itself; reu_fetch_mul_row writes all of them):
+;       reu_c64_lo/hi = mul_dma_lo
+;       reu_len_lo/hi = $00 / $02 (i.e. 512-byte transfer)
+;       reu_reu_lo    = $00
+;       reu_addr_ctrl = $00
+;   DMA #2 below STOMPS that latch (mul_dma_carry / 256), which is why
+;   DMA #1 rewrites all five registers on every call rather than
+;   trusting the latch: iterations 2..N of fe25519_sqr's loop would
+;   otherwise inherit DMA #2's state and fetch 256 bytes into
+;   mul_dma_carry, corrupting the doubled-lo/hi rows. After this proc
+;   the latch is left as DMA #2 set it; reu_clear_wide's tail restores
+;   the canonical state before the next fe25519_mul. Regression:
+;   `tools/test_fe_sqr_then_mul.py`.
+;
+; CT: straight-line apart from REU_SETTLE (L31, branch on hardware
+; state only); mul_cached_a is used only as a DMA address, never in a
+; branch. Same instruction sequence for every input.
+;
+; Gated on `SQR_DMA_K`: when SQR_DMA_K = 0 (the v0.6 1764-variant
+; build), `fe25519_sqr` never dispatches to the DMA path so this proc
+; is dead code (mirrors the SQR_DMA_K gate inside reu_mul_init above
+; and LIB_X25519_REU_BANKS_USED's $3B↔$03 flip in src/lib_manifest.s).
+; The matching `.export reu_fetch_doubled_row` at the top of this
+; file is gated under the same condition, and `src/fe25519.s`'s
+; `.import` + DMA-dispatch block are gated too.
+; =============================================================================
+.if ::SQR_DMA_K
+.proc reu_fetch_doubled_row
+        ; --- DMA #1: 512 bytes to mul_dma_lo/hi from the DOUBLED bank
+        ;     pair, offset a*512. Latch registers first (see banner).
+        lda #<(mul_dma_lo)
+        sta reu_c64_lo
+        lda #>(mul_dma_lo)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #2
+        sta reu_len_hi         ; 512 bytes
+        lda mul_cached_a
+        asl                    ; A = a*2, C = bit 7 of a
+        sta reu_reu_hi
+        lda #X25519_REU_BANK_DOUBLED
+        adc #0                 ; bank = DOUBLED + (a >> 7)
+        sta reu_reu_bank
+        lda #%10110001         ; execute + autoload + FETCH (REU->C64)
+        sta reu_command
+        REU_SETTLE             ; §8.2: confirm END OF BLOCK + settle
+
+        ; --- DMA #2: 256 bytes to mul_dma_carry from CARRY bank,
+        ;     offset a*256 (raw a, not a << 1).
+        lda #<(mul_dma_carry)
+        sta reu_c64_lo
+        lda #>(mul_dma_carry)
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_len_lo
+        sta reu_addr_ctrl
+        lda #1
+        sta reu_len_hi         ; 256 bytes
+        lda mul_cached_a
+        sta reu_reu_hi
+        lda #X25519_REU_BANK_CARRY
+        sta reu_reu_bank
+        lda #%10110001
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+        rts
+.endproc
+.endif  ; SQR_DMA_K
+
+; =============================================================================
+; reu_clear_wide - Zero fe_wide[0..63] ($40..$7F) via 64-byte CPU loop
+;
+; W2 cleanup: previously this routine FETCHed 64 pre-stashed zero bytes
+; from REU bank 2. The REU round-trip (~150 cy) was costlier than the
+; CPU clear (~640 cy on 6502, but only ~10.7 jif/scalarmult amortized
+; over fe25519_mul invocations), and it created a dangerous coupling:
+; if a previous fe25519_sqr's reu_fetch_doubled_row inline carry-fetch
+; (DMA #2, see that proc) had reconfigured the REU registers
+; (different bank, different length, autoload off), the next
+; reu_clear_wide would silently fetch garbage. The CPU clear is
+; bank-state-independent and removes that failure mode.
+;
+; The autoload-restore tail at the end of this proc is CRITICAL for
+; the same reason: fe25519_mul's per-row inline DMA (in fe25519.s)
+; relies on the REU registers being pre-configured to fetch from
+; mul_dma_lo with len=512 and autoload latched. Without the tail
+; below, an immediately following fe25519_mul would inherit whatever
+; the previous fe25519_sqr left in the autoload latch via
+; reu_fetch_doubled_row's inline DMA #2 (256 bytes to mul_dma_carry
+; from bank +3) and read the 17th-bit carry table by mistake. This
+; was caught by the mul(1,1)-after-sqr(1) → 0 regression (W2 root
+; cause analysis). The post-fetch_doubled_row latched state is
+; determined entirely by its DMA #2 (DMA #1's autoload-completed state
+; is mul_dma_lo / 512 and is overwritten), so the restore obligation
+; is the same whichever way DMA #1 is issued.
+;
+; Clobbers: A, X
+; =============================================================================
+.proc reu_clear_wide
+        ; CPU clear of fe_wide[0..63] in zero page ($40..$7F).
+        ; (fe_wide is .assert'd to ZP; see src/zp_config.s. zp,X
+        ;  store is 4 cyc; 64 iters * 4 cyc = ~256 cy plus DEX/BPL.)
+        lda #0
+        ldx #63
+@loop:
+        sta fe_wide,x
+        dex
+        bpl @loop
+
+.if ::X25519_ONCHIP_MUL = 0
+        ; Restore mul-row autoload state. fe25519_mul's per-row inline
+        ; DMA expects:
+        ;   reu_c64_lo/hi   = mul_dma_lo
+        ;   reu_len_lo/hi   = $0000 / $0002 (i.e. 512-byte transfer)
+        ;   reu_reu_lo      = $00 (already 0 from autoload latch)
+        ;   reu_addr_ctrl   = $00 (already 0 from autoload latch)
+        ; A previous fe25519_sqr's reu_fetch_doubled_row inline DMA #2
+        ; (256 bytes to mul_dma_carry from bank +3, see that proc) may
+        ; have left reu_c64_* pointing at mul_dma_carry and reu_len_hi
+        ; at $01; without restoring here the next fe25519_mul reads
+        ; garbage.
+        lda #<mul_dma_lo
+        sta reu_c64_lo
+        lda #>mul_dma_lo
+        sta reu_c64_hi
+        lda #0
+        sta reu_len_lo
+        lda #2
+        sta reu_len_hi
+.endif ; X25519_ONCHIP_MUL = 0 (issue #72 — autoload-restore tail; the
+       ; CPU clear above is all the onchip profile needs)
+        rts
+.endproc
+
+; =============================================================================
+; reu_probe - Opt-in REU presence check
+;
+; Writes a sentinel byte ($5A) to REU bank 7 / $0000 via STASH, then
+; reads it back via FETCH and compares to the original byte. If the
+; round-trip recovers the sentinel, we have a working REU; otherwise
+; the call is on a non-REU host (or a broken / under-sized REU).
+;
+; Bank 7 is chosen because the library only uses banks 0-5 (multiply
+; tables) and bank 2 (zero block, no longer needed but still populated
+; for legacy callers). Bank 7 is far enough away that we won't trample
+; library state even on a misconfigured host.
+;
+; The original byte at the probed address is restored before returning,
+; so reu_probe is safe to call before sqtab_init / reu_mul_init.
+;
+; Output:
+;   C = 1   REU is present and round-trips the sentinel correctly
+;   C = 0   no REU detected (or REU is faulty, or a §8.2 v0.13.0
+;           settle fault was recorded in x25519_reu_fault during the
+;           probe's four DMAs — inspect that byte to tell them apart)
+;
+; This routine saves and restores enough REU state that subsequent
+; sqtab_init / reu_mul_init / x25519_scalarmult calls work as if it
+; had not run. It does NOT preserve the autoload latch state, so it
+; should be called BEFORE the REU table builds (reu_mul_init, or the
+; provider's init + x25519_sqr_tables_init under §8.2 deferral), not
+; in the middle of a session.
+;
+; Cost: ~200-250 cycles. Caller-controlled — not invoked by the
+; library itself; downstream hosts targeting mixed C64 hardware can
+; gate sqtab_init / reu_mul_init on `bcc no_reu`.
+;
+; Clobbers: A, X, Y. Touches REU bank 7 offset $0000 (restored).
+; =============================================================================
+; Cold segment again (issue #68): reu_probe is boot-only by contract —
+; its banner mandates calling it BEFORE the REU table builds because
+; it does not preserve the autoload latch.
+.segment "LIB_X25519_CODE"
+
+.if ::X25519_ONCHIP_MUL = 0
+; (reu_probe gated out under onchip, issue #72: the profile by
+;  definition runs without an REU, so presence detection is
+;  meaningless inside it. Hosts that want runtime hardware dispatch
+;  link the default-profile archive and probe there.)
+.export reu_probe
+.proc reu_probe
+        lda #0
+        sta x25519_reu_fault   ; §8.2 v0.13.0: fresh fault window
+        ; Save original REU register set we are about to disturb so the
+        ; library's own state machine isn't surprised after probing.
+        lda reu_c64_lo
+        sta @save_c64_lo
+        lda reu_c64_hi
+        sta @save_c64_hi
+        lda reu_reu_lo
+        sta @save_reu_lo
+        lda reu_reu_hi
+        sta @save_reu_hi
+        lda reu_reu_bank
+        sta @save_reu_bank
+        lda reu_len_lo
+        sta @save_len_lo
+        lda reu_len_hi
+        sta @save_len_hi
+
+        ; First: read the existing byte at bank 7 / $0000 into @scratch
+        ; via a 1-byte FETCH so we can restore it later.
+        lda #<@scratch
+        sta reu_c64_lo
+        lda #>@scratch
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_reu_hi
+        sta reu_addr_ctrl
+        lda #7+X25519_REU_BANK
+        sta reu_reu_bank
+        lda #1
+        sta reu_len_lo
+        lda #0
+        sta reu_len_hi
+        lda #%10010001         ; execute (no autoload) + FETCH
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+        lda @scratch
+        sta @orig_byte         ; remember pre-probe byte for restore
+
+        ; Write sentinel $5A to bank 7 / $0000 via 1-byte STASH.
+        lda #$5A
+        sta @scratch
+        lda #<@scratch
+        sta reu_c64_lo
+        lda #>@scratch
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_reu_hi
+        sta reu_addr_ctrl
+        lda #7+X25519_REU_BANK
+        sta reu_reu_bank
+        lda #1
+        sta reu_len_lo
+        lda #0
+        sta reu_len_hi
+        lda #%10010000         ; execute (no autoload) + STASH
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+        ; Round-trip read back to scratch, then capture it in @rt_byte
+        ; before any subsequent DMA can stomp scratch.
+        lda #0
+        sta @scratch           ; clear so a no-op DMA leaves it 0, not $5A
+        lda #<@scratch
+        sta reu_c64_lo
+        lda #>@scratch
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_reu_hi
+        sta reu_addr_ctrl
+        lda #7+X25519_REU_BANK
+        sta reu_reu_bank
+        lda #1
+        sta reu_len_lo
+        lda #0
+        sta reu_len_hi
+        lda #%10010001         ; execute (no autoload) + FETCH
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+        lda @scratch           ; latch fetched byte to a private slot
+        sta @rt_byte
+
+        ; Restore the original byte at bank 7 / $0000 BEFORE we examine
+        ; the result, so the caller's REU is undisturbed even if the
+        ; check fails.
+        lda @orig_byte
+        sta @scratch
+        lda #<@scratch
+        sta reu_c64_lo
+        lda #>@scratch
+        sta reu_c64_hi
+        lda #0
+        sta reu_reu_lo
+        sta reu_reu_hi
+        sta reu_addr_ctrl
+        lda #7+X25519_REU_BANK
+        sta reu_reu_bank
+        lda #1
+        sta reu_len_lo
+        lda #0
+        sta reu_len_hi
+        lda #%10010000         ; execute (no autoload) + STASH (restore)
+        sta reu_command
+        REU_SETTLE             ; §8.2 v0.13.0: confirm END OF BLOCK + settle
+
+        ; Now restore the saved REU register set the caller may rely on.
+        lda @save_c64_lo
+        sta reu_c64_lo
+        lda @save_c64_hi
+        sta reu_c64_hi
+        lda @save_reu_lo
+        sta reu_reu_lo
+        lda @save_reu_hi
+        sta reu_reu_hi
+        lda @save_reu_bank
+        sta reu_reu_bank
+        lda @save_len_lo
+        sta reu_len_lo
+        lda @save_len_hi
+        sta reu_len_hi
+        lda #0
+        sta reu_addr_ctrl
+
+        ; Compare the latched round-trip byte (captured to @rt_byte
+        ; immediately after the FETCH step, before any restore-DMA
+        ; could overwrite @scratch). $5A means the REU returned the
+        ; sentinel we wrote: REU present.
+        lda @rt_byte
+        cmp #$5A
+        bne @fail
+        ; §8.2 v0.13.0: a bounded-spin expiry or verify fault during any
+        ; of the four probe DMAs is surfaced the same way a missing REU
+        ; is (the contract's SHOULD) — C = 0. The sticky byte keeps the
+        ; distinction for hosts that want it.
+        lda x25519_reu_fault
+        bne @fail
+        sec                    ; C = 1: REU OK
+        rts
+@fail:
+        clc                    ; C = 0: REU not present / not working /
+        rts                    ;        settle fault (see x25519_reu_fault)
+
+@scratch:       .byte 0        ; 1-byte DMA scratch buffer
+@orig_byte:     .byte 0        ; saved pre-probe byte at bank7/$0000
+@rt_byte:       .byte 0        ; round-trip readback latched before restore
+@save_c64_lo:   .byte 0
+@save_c64_hi:   .byte 0
+@save_reu_lo:   .byte 0
+@save_reu_hi:   .byte 0
+@save_reu_bank: .byte 0
+@save_len_lo:   .byte 0
+@save_len_hi:   .byte 0
+.endproc
+.endif ; X25519_ONCHIP_MUL = 0 (issue #72 — reu_probe)

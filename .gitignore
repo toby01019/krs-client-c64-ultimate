@@ -1,0 +1,9 @@
+**/build/
+**/__pycache__/
+*.pyc
+*.o
+*.exe
+*.dll
+.env
+*.pem
+*.key

@@ -1,0 +1,339 @@
+.setcpu "6502"
+
+; =============================================================================
+; reu_config.s - public REU layout configuration for c64-x25519.
+;
+; Per c64-lib-contract SPEC.md §3 (REU layout contract). Consumer projects
+; that compose c64-x25519 alongside other REU-using libraries (P-256
+; precompute, ChaCha20 scratch, etc.) need to relocate c64-x25519's six
+; mul-table banks to avoid silent bank collisions. The two equates below
+; let them do so via `ca65 -D`.
+;
+; Bank allocation at the default base
+; -----------------------------------
+;
+; c64-x25519 claims five REU banks for its precomputed multiplication
+; tables, allocated as follows (relative to X25519_REU_BANK):
+;
+;   bank + 0   ; 8x8->16 mul tables, lo+hi, for a = 0..127   (full bank)
+;   bank + 1   ; 8x8->16 mul tables, lo+hi, for a = 128..255 (full bank)
+;   bank + 2   ; unused (legacy zero stash removed in v0.6 prep — free
+;              ;         for sibling consumers within the reserved range)
+;   bank + 3   ; 17th-bit carry bytes for doubled tables     (256 bytes/row)
+;   bank + 4   ; pre-doubled mul tables, lo+hi, a = 0..127   (full bank)
+;   bank + 5   ; pre-doubled mul tables, lo+hi, a = 128..255 (full bank)
+;
+; The library also uses bank + 7 transiently during `reu_probe` (sentinel
+; round-trip), which is restored before the probe returns.
+;
+; Total claimed range: 5 banks (bank + 2 is held within the bank-allocation
+; window but not touched). Probe transiently touches a 7th bank but does
+; not claim it.
+;
+; Default override
+; ----------------
+;
+; X25519_REU_BANK = 0 → banks 0..5 used (= original v0.4.0 layout).
+;
+; A consumer overrides via `ca65 -D X25519_REU_BANK=0x03` (or by
+; pre-defining the symbol in a wrapper .s) when rebuilding the library
+; from source. Every library translation unit must be assembled with the
+; same value because the bank constant is baked in at assemble time.
+;
+; X25519_REU_OFFSET is published as a contract-compliance equate, but
+; the current library implementation places each table at offset 0
+; within its bank (the tables span full banks), so the equate is pinned
+; to 0 by a hard assert below; it exists so consumers can assert against
+; it.
+; =============================================================================
+
+.ifndef REU_CONFIG_S_INCLUDED
+REU_CONFIG_S_INCLUDED = 1
+
+; Onchip-profile flag (issue #72). This file is both .include'd via
+; constants.s AND assembled standalone as reu_config.o, so it needs
+; its own .ifndef default for the gates below (same composition idiom
+; as every other override in this file).
+.ifndef X25519_ONCHIP_MUL
+  X25519_ONCHIP_MUL = 0
+.endif
+
+.ifndef X25519_REU_BANK
+  .ifdef LIB_SHARED_REU_MUL_BANK
+    ; The §8.2 consumer override drives the whole window: x25519
+    ; places the shared mul table at the window base, so relocating
+    ; the table relocates X25519_REU_BANK with it. (Pre-#82-audit
+    ; this knob was decorative — published but never read by any
+    ; code path, which all use X25519_REU_BANK.)
+    X25519_REU_BANK = LIB_SHARED_REU_MUL_BANK
+  .else
+    X25519_REU_BANK = $00
+  .endif
+.endif
+
+.ifndef X25519_REU_OFFSET
+  X25519_REU_OFFSET = $0000
+.endif
+
+; --- Derived symbolic bank names (used by src/x25519_init.s) ---
+;
+; Prior to v0.7.0 prep these were spelled `4+X25519_REU_BANK` and
+; `3+X25519_REU_BANK` inline inside reu_fetch_doubled_row. Naming them
+; here lets the SPEC §8.2 + #15 follow-up SMC refactor land without
+; touching every literal callsite, and keeps the "bank 3 = carry,
+; banks 4..5 = doubled mul" mapping visible at the configuration
+; boundary rather than buried in the fetch routine.
+;
+; See src/x25519_init.s comments at reu_fetch_doubled_row for the
+; semantics; see also c64-lib-contract SPEC §8.2 "Related future
+; promotions" bullet on the SMC-parameterised shared fetch (#15).
+X25519_REU_BANK_DOUBLED = X25519_REU_BANK + 4
+X25519_REU_BANK_CARRY   = X25519_REU_BANK + 3
+
+; =============================================================================
+; c64-lib-contract SPEC §8.2: Shared 8x8->16 REU multiplication table
+; =============================================================================
+;
+; The 128 KB (a, b) -> a*b lookup table (256 rows x 512 bytes), occupying
+; two contiguous REU banks. c64-x25519 and c64-nist-curves both build a
+; bit-identical copy of this table today; SPEC §8.2 promotes it to a
+; consumer-placement-overridable shared primitive so a consumer linking
+; both libraries can supply one base bank via LIB_SHARED_REU_MUL_BANK
+; and avoid a wasted 128 KB.
+;
+; Default (LIB_SHARED_REU_MUL_BANK = X25519_REU_BANK) keeps x25519's
+; pre-§8.2 layout (banks 0+1) bit-identical for standalone builds. A
+; consumer overrides via `ca65 -D LIB_SHARED_REU_MUL_BANK=0x<bank>`
+; (every translation unit must see the same value because the bank
+; constant is baked in at assemble time).
+;
+; The actual init body lives in src/x25519_init.s under .ifndef
+; SHARED_REU_MUL_INIT (migration gate). The canonical entry point is
+; `reu_mul_tables_init` (alias of `reu_mul_init`).
+;
+; SPEC v0.9.1-C: SHARED_REU_MUL_INIT and SHARED_REU_MUL_FETCH MUST
+; move together — partial deferral creates a §8.0 ownership state
+; with no table row (an owner of the fetch that is not an owner of
+; the primitive, or vice versa).
+.ifdef SHARED_REU_MUL_INIT
+.ifndef SHARED_REU_MUL_FETCH
+.error "SHARED_REU_MUL_INIT requires SHARED_REU_MUL_FETCH (SPEC v0.9.1 §8.2: the two deferral switches move together)"
+.endif
+.endif
+.ifdef SHARED_REU_MUL_FETCH
+.ifndef SHARED_REU_MUL_INIT
+.error "SHARED_REU_MUL_FETCH requires SHARED_REU_MUL_INIT (SPEC v0.9.1 §8.2: the two deferral switches move together)"
+.endif
+.endif
+.ifndef LIB_SHARED_REU_MUL_BANK
+  LIB_SHARED_REU_MUL_BANK = X25519_REU_BANK
+.endif
+
+; The two knobs name one value: the shared mul table sits at the REU
+; window base in this library. Overriding both to different values
+; would publish a placement the code does not implement — hard error.
+.assert LIB_SHARED_REU_MUL_BANK = X25519_REU_BANK, error, "LIB_SHARED_REU_MUL_BANK and X25519_REU_BANK must agree (x25519 places the shared mul table at the REU window base; override either knob, not both)"
+
+
+.ifndef LIB_SHARED_REU_MUL_OFFSET
+  LIB_SHARED_REU_MUL_OFFSET = $0000
+.endif
+
+; Derived two-bank mask per SPEC §8.2 (the table claims `base` and
+; `base + 1`). Consumers compose it into REU-region collision
+; `.assert`s instead of rewriting `(1 .shl bank) | (1 .shl (bank+1))`
+; at every callsite. Libraries OR it into their own
+; LIB_<X>_REU_BANKS_USED (§5) when they consume the canonical primitive.
+;
+; `.shl` (not `<<`) matches the existing LIB_*_REU_BANKS_USED idiom in
+; src/lib_manifest.s and the c64-lib-contract SPEC §8.2 canonical text.
+LIB_SHARED_REU_MUL_BANKS_USED = (1 .shl LIB_SHARED_REU_MUL_BANK) | (1 .shl (LIB_SHARED_REU_MUL_BANK + 1))
+
+; SPEC §8.2 assemble-time guards:
+;   - offset $0000:  v0.x.0 row-stride constraint (start-of-bank required)
+;   - base   < 31:   the hi-half bank lives at base+1, and §5's bank mask
+;                    is 32 bits wide, so base 31 shifts the hi-half bit
+;                    off the top and the mask NAMES ONLY THE LO BANK.
+;                    Tightened from `< $FE` at contract SPEC v1.0.0, which
+;                    names this line as an adopter still carrying the loose
+;                    bound: `$FE` bounded the bank NUMBER but not the mask
+;                    it feeds, so a consumer's disjointness assert passed
+;                    over a bank the table really does claim. Default bank
+;                    is 0, so nothing measurable changes here; the bound is
+;                    adopted because it is the one that guards the export.
+.assert LIB_SHARED_REU_MUL_OFFSET = $0000, error, "reu_mul must start at offset 0 within its bank pair (SPEC §8.2 v0.x.0)"
+.assert LIB_SHARED_REU_MUL_BANK < 31,      error, "reu_mul base bank must leave room for the hi-half bank at base+1 inside the 32-bit §5 bank mask (SPEC §8.2)"
+; X25519_REU_OFFSET is pinned: no code path reads it (every table access
+; uses offset 0 within its bank), so any other value would be exported but
+; not honoured.
+.assert X25519_REU_OFFSET = 0, error, "X25519_REU_OFFSET must be 0: the REU tables are not offset-relocatable (they span full banks); relocate them with X25519_REU_BANK instead"
+
+; --- SPEC §8.2 ZP scratch contract ---
+;
+; The canonical init exposes two ZP-scratch slot equates so a consumer
+; can redirect the per-byte init counters when composing libraries that
+; have different ZP-budget pressures. c64-x25519's existing reu_mul_init
+; uses two bytes of scratch (`reu_init_a` / `reu_init_b`, declared
+; inside the .proc; .global'd from x25519_init.s so the equates can
+; resolve to them at link time). As of the issue-#68 cold-segment
+; split these default slots live in the reclaimable
+; LIB_X25519_INIT_CODE segment with the proc that owns them — they are
+; init-lifetime only, so a consumer that reclaims the segment must not
+; expect the addresses to stay meaningful afterwards. A consumer that
+; pins these to real ZP can override either equate via
+; `ca65 -D`.
+;
+; Defaults point at those init-segment scratch slots so the
+; standalone build is bit-identical. The `:= reu_init_a` form is a
+; link-time alias (not a value-baked equate) so neither symbol must be
+; resolved at the time constants.s is parsed.
+.if ::X25519_ONCHIP_MUL = 0
+.ifndef SHARED_REU_MUL_INIT
+; (Aliases gated under onchip, issue #72: reu_init_a/b live inside the
+;  gated-out reu_mul_init proc, so a link-time alias would dangle.
+;  Same dangle under SHARED_REU_MUL_INIT — the proc that owns the
+;  scratch slots is deferred to the canonical §8.2 provider, which
+;  then also owns the ZP_INIT_A/B equates. Caught by R6 /
+;  `make lib-verify-shared`.)
+.ifndef LIB_SHARED_REU_MUL_ZP_INIT_A
+  .global reu_init_a
+  LIB_SHARED_REU_MUL_ZP_INIT_A := reu_init_a
+.endif
+.ifndef LIB_SHARED_REU_MUL_ZP_INIT_B
+  .global reu_init_b
+  LIB_SHARED_REU_MUL_ZP_INIT_B := reu_init_b
+.endif
+.endif ; SHARED_REU_MUL_INIT not defined
+.endif
+
+; --- SPEC §8.2 staging-buffer contract ---
+;
+; The canonical per-row fetch (`reu_fetch_mul_row`) writes 512 bytes to a
+; page-aligned pair of 256-byte staging buffers. c64-x25519's existing
+; `mul_dma_lo` / `mul_dma_hi` labels (data.s) satisfy the shape; the
+; canonical SPEC §8.2 names alias them via link-time references so a
+; consumer that pre-defines either equate to a different page-aligned
+; address can compose freely (every TU must agree on the override; same
+; mechanism as the other LIB_SHARED_* equates).
+;
+; Page-alignment and adjacency are CT-critical (the fetch primitive's
+; 4x-unrolled abs,y accumulator loop assumes no cross-page indexing);
+; the .assert`s catch override mistakes at assemble time. Byte-level `&`
+; masking is the existing repo idiom for the same kind of check (see
+; constants.s LIB_SHARED_SQTAB_BASE asserts).
+.ifndef LIB_SHARED_REU_MUL_STAGE_LO
+  .global mul_dma_lo
+  LIB_SHARED_REU_MUL_STAGE_LO := mul_dma_lo
+.endif
+.ifndef LIB_SHARED_REU_MUL_STAGE_HI
+  .global mul_dma_hi
+  LIB_SHARED_REU_MUL_STAGE_HI := mul_dma_hi
+.endif
+
+.assert (LIB_SHARED_REU_MUL_STAGE_LO & $00ff) = 0, lderror, "LIB_SHARED_REU_MUL_STAGE_LO must be page-aligned (SPEC §8.2)"
+.assert (LIB_SHARED_REU_MUL_STAGE_HI & $00ff) = 0, lderror, "LIB_SHARED_REU_MUL_STAGE_HI must be page-aligned (SPEC §8.2)"
+.assert LIB_SHARED_REU_MUL_STAGE_HI = LIB_SHARED_REU_MUL_STAGE_LO + $0100, lderror, "LIB_SHARED_REU_MUL_STAGE_HI must follow STAGE_LO by $0100 (SPEC §8.2)"
+
+; --- Exports (suppressed when transitively .include'd via constants.s) ---
+; Forced to absolute (16-bit) symbols. X25519_REU_BANK fits in a byte,
+; which would otherwise let ca65 infer zeropage size and produce
+; address-size-mismatch warnings on consumer-side `.import` declarations.
+.ifndef REU_CONFIG_NO_EXPORTS
+
+.export X25519_REU_BANK:         abs
+.export X25519_REU_OFFSET:       abs
+.export X25519_REU_BANK_DOUBLED: abs
+.export X25519_REU_BANK_CARRY:   abs
+
+.if ::X25519_ONCHIP_MUL = 0
+; SPEC §8.2 surface, LIBRARY-PREFIXED (contract #82): the unprefixed
+; LIB_SHARED_REU_MUL_* names are consumer-INPUT knobs — assemble-time
+; equates every adopter carries locally, set via `ca65 -D` — and
+; exporting them collides with any co-linked §8.2 adopter
+; (`Duplicate external identifier`, measured against c64-nist-curves;
+; the c64-https pair is the live victim). Only exported symbols can
+; collide (§8.0 rationale; §8.1's LIB_SHARED_SQTAB_BASE precedent —
+; exported by no adopter). The prefixed forms below are library
+; OUTPUT — "what this build baked in" — so a composing consumer can
+; cross-check placements:
+;   .assert LIB_X25519_SHARED_REU_MUL_BANK = LIB_<other>_SHARED_REU_MUL_BANK, lderror, "shared mul table placement disagreement"
+; Whole §8.2 surface gated out under the onchip profile (issue #72):
+; the build neither provides nor consumes the canonical REU mul
+; table (LIB_X25519_REU_BANKS_USED = 0 is the authoritative claim).
+LIB_X25519_SHARED_REU_MUL_BANK       = LIB_SHARED_REU_MUL_BANK
+LIB_X25519_SHARED_REU_MUL_OFFSET     = LIB_SHARED_REU_MUL_OFFSET
+LIB_X25519_SHARED_REU_MUL_BANKS_USED = LIB_SHARED_REU_MUL_BANKS_USED
+.export LIB_X25519_SHARED_REU_MUL_BANK:        abs
+.export LIB_X25519_SHARED_REU_MUL_OFFSET:      abs
+.export LIB_X25519_SHARED_REU_MUL_BANKS_USED:  abs
+
+; ZP scratch + staging buffer aliases: link-time aliases of
+; x25519-private labels (reu_init_a/b in x25519_init.s, mul_dma_lo/hi
+; in data.s) — per-library addresses by nature, so the prefixed name
+; is the only coherent export shape. No `abs` hint: the target labels
+; carry their own address sizes.
+.ifndef SHARED_REU_MUL_INIT
+; ZP_INIT_A/B additionally gated under SHARED_REU_MUL_INIT (R6): the
+; alias definitions above are dropped in a deferral build (reu_init_a/b
+; live inside the gated-out reu_mul_init proc), and the canonical §8.2
+; provider owns these slots. STAGE_LO/HI stay — mul_dma_lo/hi back
+; the retained per-row fetch surface.
+LIB_X25519_SHARED_REU_MUL_ZP_INIT_A := LIB_SHARED_REU_MUL_ZP_INIT_A
+LIB_X25519_SHARED_REU_MUL_ZP_INIT_B := LIB_SHARED_REU_MUL_ZP_INIT_B
+.export LIB_X25519_SHARED_REU_MUL_ZP_INIT_A
+.export LIB_X25519_SHARED_REU_MUL_ZP_INIT_B
+.endif ; SHARED_REU_MUL_INIT not defined
+LIB_X25519_SHARED_REU_MUL_STAGE_LO := LIB_SHARED_REU_MUL_STAGE_LO
+LIB_X25519_SHARED_REU_MUL_STAGE_HI := LIB_SHARED_REU_MUL_STAGE_HI
+.export LIB_X25519_SHARED_REU_MUL_STAGE_LO
+.export LIB_X25519_SHARED_REU_MUL_STAGE_HI
+
+; --- SPEC §8.2: "The exported value MUST be the value the code reads" ------
+;
+; x25519 does NOT relocate the staging buffers. `src/data.s:161-165`
+; defines mul_dma_lo/hi/carry with a plain `.res` and never consults
+; LIB_SHARED_REU_MUL_STAGE_LO/_HI; `src/fe25519.s:54` and
+; `src/x25519_init.s:50` `.import` the private labels and index them
+; directly, and x25519_init additionally bakes mul_dma_lo/hi's address
+; into the REU transfer descriptors as immediates (`lda #<(mul_dma_lo)`
+; and friends). So an override reaches the export and nothing else.
+;
+; Until v0.14.0 that meant `-D LIB_SHARED_REU_MUL_STAGE_LO=0xC000` built
+; clean, `make lib-verify` exited 0, and the archive exported
+; LIB_X25519_SHARED_REU_MUL_STAGE_LO = $C000 while every access path read
+; mul_dma_lo at $1B00 (measured in the linked image: `al 001B00
+; .mul_dma_lo`). That is precisely the export §8.2 line 391 calls a
+; certificate that certifies nothing — and it is worse than useless,
+; because the export exists so a consumer can cross-check two co-linked
+; §8.2 adopters' placements, and a false agreement is what it produced.
+;
+; These asserts make the export true by construction: it either equals
+; what the code reads, or the link fails and names the knob. An override
+; we cannot honour is now a loud error instead of a silent lie.
+;
+; NOT fixed by relocating the buffers, deliberately. Page alignment of
+; all three is a hard CT invariant (`src/data.s:175-177`), the eight
+; `adc mul_dma_*,y` sites index with a secret Y across the full 0..255
+; range, and the REU descriptors above bake the address in — so honouring
+; the knob is a real change owing VICE validation, not a doc fix. §8.2's
+; staging export is conditional ("A library that honours the staging
+; knobs SHOULD also export ..."), so pinning keeps us honestly inside the
+; SHOULD where exporting an unhonoured number did not.
+;
+; lderror, not error: mul_dma_lo/hi are link-time addresses.
+;
+; The .global pair is UNCONDITIONAL and must stay so. The one at :221/:225
+; sits inside `.ifndef LIB_SHARED_REU_MUL_STAGE_LO` — i.e. it fires only
+; when the consumer did NOT override, which is exactly the case these
+; asserts do not need to catch. Relying on it made the override fail with
+; `Error: Symbol 'mul_dma_lo' is undefined` at assemble time, naming an
+; internal label instead of the knob: a correct rejection for the wrong
+; reason, and useless to the consumer reading it.
+.global mul_dma_lo, mul_dma_hi
+.assert LIB_X25519_SHARED_REU_MUL_STAGE_LO = mul_dma_lo, lderror, "LIB_SHARED_REU_MUL_STAGE_LO override is not honoured by c64-x25519: the code reads mul_dma_lo (src/data.s). Rebuild without the override, or relocate the LIB_X25519_DATA segment in your cfg instead (SPEC §8.2: the exported value MUST be the value the code reads)"
+.assert LIB_X25519_SHARED_REU_MUL_STAGE_HI = mul_dma_hi, lderror, "LIB_SHARED_REU_MUL_STAGE_HI override is not honoured by c64-x25519: the code reads mul_dma_hi (src/data.s). Rebuild without the override, or relocate the LIB_X25519_DATA segment in your cfg instead (SPEC §8.2: the exported value MUST be the value the code reads)"
+.endif ; X25519_ONCHIP_MUL = 0 (issue #72 — §8.2 export surface)
+
+.endif ; REU_CONFIG_NO_EXPORTS
+
+.endif ; REU_CONFIG_S_INCLUDED

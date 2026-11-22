@@ -1,0 +1,1 @@
+Workspace development harnesses, for inspection. They expect the original work/krs-offload layout, upstream ABI snapshot, ziglang 0.13.0 and py65. Compiler binaries, OS test seeds and test executables are NOT included. Portable firmware and standalone cc65 source builds are in ../firmware and ../c64-source.
