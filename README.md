@@ -24,6 +24,43 @@ custom firmware; no flashable firmware provided. See
 [experimental/ultimate-ii-plus](experimental/ultimate-ii-plus/README.md).
 It is separate from the tested C64 Ultimate client.
 
+## VICE on a Windows PC / VICE am Windows-PC
+
+**Separate experimental download: [KRS-Client-VICE-Windows-20261125.zip](https://github.com/toby01019/krs-client-c64-ultimate/releases/tag/vice-v2026.11.25).**
+
+Deutsch: ZIP entpacken, VICE 3.10 (GTK3/x64sc) und Python 3.10+ installieren,
+dann `Start-Windows.cmd` starten und x64sc.exe auswaehlen. Kein echter
+Ultimate erforderlich. Der Starter richtet 512 KB emulierte REU ein.
+80 Zeichen sind Standard; F2 wechselt 40/80. Anleitung und Hintergrund
+liegen im ZIP als `ERST-LESEN.txt`, `LIESMICH.txt`, `HINTERGRUND-DE.txt`.
+
+English: Extract the ZIP, install VICE 3.10 (GTK3/x64sc) and Python 3.10+,
+then run `Start-Windows.cmd` and select x64sc.exe. No physical Ultimate is
+required. The launcher configures 512 KB emulated REU. The default view is
+80 columns; F2 toggles 40/80. Read `README-EN.txt` and `BACKGROUND-EN.txt`.
+VICE and Python are not bundled. Other operating systems are untested.
+The 6502 UI runs in VICE; a local Python helper provides verified HTTPS.
+This is a separate client port, not a complete Ultimate emulator.
+The download includes source code and German/English instructions.
+
+### Hintergrund / Background
+
+Deutsch: PC Games Hardware berichtet ueber gerettete Disketten mit
+Nachrichten von 1985/1986, vor allem aus Hamburgs TMC-Mailbox.
+Die Texte sind heute in K.R.S. lesbar. K.R.S. ist ein modernes Websystem
+mit Archiv, nicht der damalige TMC-Server. Unser unabhaengiger Client
+ermoeglicht den Zugang auch auf dem Ultimate und mit VICE am PC.
+
+English: PC Games Hardware reports on recovered disks containing messages
+from 1985/1986, mainly from Hamburg's TMC BBS. These texts can now be read
+in K.R.S., a modern web system with archived material, not the original
+TMC server. Our independent client also provides access on Ultimate and
+through VICE on a PC.
+
+Independent DE/EN summary by Toby. Source: [PC Games Hardware,
+Marc Zander, 12 October 2026](https://www.pcgameshardware.de/Retrospektive-Thema-214694/News/Historische-TMC-Mailbox-lebt-dank-alter-Disketten-weiter-1556423/).
+Original article in German. [K.R.S. web access](https://quipzz.bplaced.net/krs/).
+
 ## Quick start (C64 Ultimate)
 
 1. Extract the release ZIP and copy KRS-CLIENT.PRG to your SD card.
@@ -59,8 +96,8 @@ cc65 executable names. Included `client/KRS-CLIENT.PRG` SHA-256:
 
 The current binary uses the Ultimate UCI networking interface and turbo
 registers. REU emulation alone does not establish compatibility with VICE.
-This download is the native Ultimate version. A separate private VICE
-test build exists; it is not included in this release.
+The native Ultimate ZIP remains separate. Use the dedicated VICE ZIP above
+for the PC port; it includes its own launcher, helper, source and guides.
 
 ## Security limits
 
@@ -83,3 +120,4 @@ crypto components, with a cc65 soft80 font. Original contributor and license
 notices are retained. See [LICENSES.md](LICENSES.md). AI assistance was used
 for development and documentation; test claims above distinguish actual
 hardware checks from prototypes.
+
