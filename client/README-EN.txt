@@ -1,6 +1,32 @@
 K.R.S. Client for Commodore 64 Ultimate
-Client update: 18 November 2026
-Download package: 22 November 2026
+Client update and download package: 25 November 2026
+
+CURRENT 25 NOVEMBER 2026 - server key and connection handling
+===========================================================
+This package replaces the previous KRS-CLIENT.PRG. Extract the ZIP and
+replace the program on your SD card; no firmware update is needed.
+The current RSA server key was independently CA-chain/hostname validated
+over TLS 1.2 and TLS 1.3 before it was pinned. The corresponding Montgomery
+RSA constants were regenerated too.
+
+The client now requests one response per connection and reconnects before
+the next action, using fast TLS resumption when available. This avoids
+using an old socket after a normal server-initiated close. Authentication
+checks are unchanged. No automatic retry of posts or user actions is added.
+
+Tested on an actual C64 Ultimate with firmware 1.2.1 on 25 November:
+startup about 20 seconds, guest login, message list, opened message,
+reconnection, F2 40/80-column switching and reading again after an idle wait.
+The test session was logged off normally; no post was sent during this test.
+The compiled certificate check accepts the current key and rejects an
+incorrect modulus and truncated/invalid DER data. The 22-November
+uppercase/lowercase fix remains included. No new physical pixel comparison.
+Other firmware versions were not retested with this update. Experimental
+software. Matching source code and German/English instructions are included.
+
+The separate Ultimate-II+ prototype is unchanged and untested on its target
+hardware. The PC/VICE build is a separate download, not this PRG.
+
 Documentation: English / German (LIESMICH.txt)
 
 SUPPORTED HARDWARE
@@ -75,6 +101,8 @@ MAILBOX AND PROJECT SOURCES
 https://quipzz.bplaced.net/krs/
 https://github.com/JC-000/c64-https
 https://github.com/cc65/cc65
+
+HISTORICAL NOTES - earlier tests and packages
 
 UPDATE 22 NOVEMBER 2026
 Includes the independently verified K.R.S. server key update from

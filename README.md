@@ -9,14 +9,27 @@ Independent client project; K.R.S. itself is operated by its own project team.
 **C64 Ultimate: guest login, reading, display and TLS reconnection tested on
 the author's hardware.** Runs without a PC, browser or external proxy.
 
-Download **KRS-Client-Ultimate-20261122-casefix.zip** from this repository's Releases
+Download **KRS-Client-Ultimate-20261125.zip** from this repository's Releases
 or [itch.io](https://toby01019.itch.io/krs-client-c64-ultimate).
-This package includes the independently verified server-key correction dated
-18 November 2026. It replaces the older October binary. Hardware evidence:
-firmware 1.2.1 on 18 November and 1.1.0s2 on 19 November. The 22-November case fix passed all 26 letter pairs in the compiled
-6502 renderer. Native K.R.S. startup/TLS and F2 switching also passed on
-firmware 1.2.1 that day; REST could not supply a physical pixel comparison.
-Source rebuild is byte-identical. Replace your old PRG with this case fix.
+Current native update: **25 November 2026**. Replaces the older native PRG.
+The current server RSA key and its Montgomery constants were independently
+checked using CA/hostname-validated TLS 1.2 and TLS 1.3 connections.
+Normal server connection closure is now handled by using one response per
+connection, with authenticated TLS resumption before the next action.
+Authentication checks and the existing poll-only retry policy remain intact;
+posts, editor submissions and other user actions are not automatically replayed.
+
+Actual C64 Ultimate firmware 1.2.1 test on 25 November: startup about20seconds,
+guest login, message list, opened message, reconnection, F2 40/80 switching,
+and reading again after an idle wait passed. The test session logged off;
+no new post was sent. The compiled certificate parser accepted the current
+key and rejected a wrong modulus, truncated and empty certificate data.
+The 22-November uppercase/lowercase fix is retained. No new physical pixel
+comparison or other-firmware retest is claimed. Source rebuild is byte-identical.
+
+Deutsch: ZIP neu entpacken und KRS-CLIENT.PRG auf der SD-Karte ersetzen.
+Keine neue Ultimate-Firmware erforderlich. Serverschluessel und Behandlung
+normaler Verbindungsabschluesse aktualisiert; Anleitung DE/EN im ZIP.
 
 **Original C64 + Ultimate-II+: EXPERIMENTAL DEVELOPMENT PROTOTYPE ONLY.**
 Not tested on its intended hardware, not ready for mailbox use, requires
@@ -91,7 +104,7 @@ Output: `source/build/KRS-CLIENT.PRG`. This existing build script uses Windows
 cc65 executable names. Included `client/KRS-CLIENT.PRG` SHA-256:
 
 ```text
-4aba652c14ac75910af785d2ec15720e1ca71c7b8d7ebb10a518d8478f376f32
+3c162590d79d503b9ec7284a502da540500a7275bf1955f74dc23fa7e58e1a3c
 ```
 
 The current binary uses the Ultimate UCI networking interface and turbo

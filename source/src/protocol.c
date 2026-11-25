@@ -282,12 +282,13 @@ unsigned char api_request(const char*a,const char*key,const char*val,unsigned ch
  if(!writing)request[p++]=125;body_len=p-200;
  if(api_error)return 0;
  p=append(0,"POST /krs/api.php HTTP/1.1\x0d\x0a" "Host: quipzz.bplaced.net\x0d\x0a" "Content-Type: application/json\x0d\x0a" "Content-Length: ");
- p=integer(p,body_len+(writing?editor_json_size()+1:0));header_len=append(p,"\x0d\x0a" "Connection: keep-alive\x0d\x0a\x0d\x0a");
+ p=integer(p,body_len+(writing?editor_json_size()+1:0));header_len=append(p,"\x0d\x0a" "Connection: close\x0d\x0a\x0d\x0a");
  if(header_len>=200)return 0;
  tls_app_ptr=request;tls_app_len=header_len;if(!send_tls())return 0;
  tls_app_ptr=request+200;tls_app_len=body_len;if(!send_tls())return 0;
  if(writing&&!editor_body())return 0;
- hs=line_len=chunked=done=has_length=http_close=0;http_status=0;json_reset();
+ /* One response per socket: avoid stale server keep-alive closures. */
+ hs=line_len=chunked=done=has_length=0;http_close=1;http_status=0;json_reset();
  start=clock();
  while(!done&&!api_error&&clock()-start<20*CLOCKS_PER_SEC){
   if(receive_tls()){

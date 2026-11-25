@@ -1,5 +1,34 @@
 K.R.S.-Client fuer Commodore 64 Ultimate - experimentell
-Programmstand: 18.11.2026; Downloadpaket: 22.11.2026
+Programmstand und Downloadpaket: 25.11.2026
+
+AKTUELL 25.11.2026 - Serverschluessel und Verbindung
+===================================================
+Dieses Paket ersetzt die bisherige KRS-CLIENT.PRG. ZIP entpacken und die
+Programmdatei auf der SD-Karte ersetzen; keine neue Firmware notwendig.
+Der aktuelle RSA-Serverschluessel wurde vor dem Einbau unabhaengig mit
+CA-Ketten- und Hostnamenpruefung fuer TLS 1.2 und TLS 1.3 abgeglichen.
+Die passenden RSA-Montgomery-Rechenwerte wurden ebenfalls neu erzeugt.
+
+Der Client fordert jetzt pro Anfrage einen Verbindungsabschluss an und
+baut die naechste verschluesselte Verbindung selbst neu auf. Die schnelle
+TLS-Wiederaufnahme wird nach Moeglichkeit verwendet. So werden regulaere
+Server-Abschluesse einer alten Verbindung nicht zur Stolperfalle bei der
+naechsten Aktion. Authentifizierung und Schreibschutz sind unveraendert;
+Beitraege oder andere Benutzeraktionen werden nicht automatisch wiederholt.
+
+Auf einem echten C64 Ultimate mit Firmware 1.2.1 am 25.11.2026 geprueft:
+Start etwa 20 Sekunden, Gastanmeldung, Nachrichtenliste, geoeffneter Beitrag,
+Wiederverbindung, F2-Wechsel 40/80 Zeichen und erneutes Lesen nach Wartezeit.
+Die Testsitzung wurde regulaer abgemeldet. Dabei keinen Beitrag gesendet.
+Kompilierte Zertifikatspruefung akzeptiert den aktuellen Schluessel und
+verwirft einen falschen Schluessel sowie abgeschnittene/ungueltige DER-Daten.
+Die Gross-/Kleinschreibkorrektur vom 22.11.2026 bleibt enthalten.
+Kein neuer physischer Pixelvergleich. Andere Firmwarestaende sind fuer
+diese neue Fassung nicht erneut getestet. Experimentelle Software.
+
+Anleitung und passender Quelltext sind enthalten. Der separate
+Ultimate-II+-Prototyp bleibt unveraendert und auf Zielhardware ungetestet.
+Die PC-/VICE-Fassung ist ein eigener Download, nicht diese PRG.
 
 START
 SD / The very Second / BBS / KRS Client / KRS-CLIENT.PRG auswaehlen und
@@ -80,7 +109,7 @@ geloescht. Keine TLS-Sitzungsschluessel werden auf die SD-Karte geschrieben.
 Der Pin stammt aus einer unabhaengig per CA validierten Verbindung.
 Keine allgemeine CA-Ketten-/Datum-Pruefung im C64. Bei Schluesselwechsel
 des Betreibers muss der Client mit unabhaengig geprueftem Pin neu gebaut
-werden. Das aktuelle Zertifikat laeuft am 06.02.2027 ab; ein unveraenderter
+werden. Das aktuell gepruefte Zertifikat laeuft am 22.02.2027 ab; ein unveraenderter
 Schluessel bleibt akzeptiert, auch bei Zertifikatserneuerung.
 Dieser RSA-Schluesselaustausch bietet KEINE Forward Secrecy. Nur den
 oeffentlichen Gastzugang verwenden; keine persoenlichen Passwoerter.
@@ -97,6 +126,8 @@ Die Quelltexte und ein cc65-Buildskript liegen im ZIP-Paket.
 https://github.com/JC-000/c64-https
 https://github.com/cc65/cc65
 https://quipzz.bplaced.net/krs/
+
+HISTORISCHER VERLAUF - fruehere Tests und Paketstaende
 
 18.11.2026: Neuer RSA-Serverschluessel unabhaengig CA-/Hostnamen-validiert.
 Gastlogin, Nachrichtenbereiche und TLS-Wiederaufnahme auf Firmware 1.2.1 getestet.
